@@ -97,6 +97,7 @@ class PlotterApp:
         self.pattern_toggle = None
         self.pots_toggle = None
         self.status_summary = None
+        self.status_summary_label = None
         self.recent_status_container = None
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
@@ -109,16 +110,27 @@ class PlotterApp:
         button.classes("px-2 py-1 text-xs")
         return button
 
+    def _apply_toggle_style(self, button: ui.button, active: bool) -> None:
+        """Apply strong visual contrast between active and inactive states."""
+        if active:
+            button.classes(remove="toggle-btn-inactive", add="toggle-btn-active")
+            button.props(remove="outline", add="unelevated")
+            button.style(
+                "transform: scale(1.04); box-shadow: 0 2px 10px rgba(0,0,0,0.20);"
+            )
+        else:
+            button.classes(remove="toggle-btn-active", add="toggle-btn-inactive")
+            button.props(remove="unelevated", add="outline")
+            button.style("transform: scale(1.0); box-shadow: none;")
+
     def _toggle_button(self, label: str, handler, state: bool) -> ui.button:
-        button = ui.button(label, on_click=handler).props("unelevated size='sm'")
-        button.classes("px-2 py-1 text-xs rounded transition-colors duration-150")
+        """Create a small toggleable button and style it via _apply_toggle_style."""
+        button = ui.button(label, on_click=handler).props("size='sm'")
+        button.classes(
+            "px-3 py-1.5 text-sm font-medium rounded-md border transition-all duration-200 ease-in-out"
+        )
         self._apply_toggle_style(button, state)
         return button
-
-    @staticmethod
-    def _apply_toggle_style(button: ui.button, state: bool) -> None:
-        button.classes(remove="toggle-btn-active toggle-btn-inactive")
-        button.classes(add="toggle-btn-active" if state else "toggle-btn-inactive")
 
     def _apply_bed_size(self, bed_size: Tuple[float, float]) -> None:
         try:
@@ -212,11 +224,17 @@ class PlotterApp:
                 on_change=self._on_workpiece_change,
             ).props("label='Workpiece' dense")
 
-        with ui.column().classes("w-full mx-auto p-4 gap-4"):
-            with ui.row().classes("w-full gap-4 items-stretch flex-nowrap").style("min-height: calc(100vh - 140px);"):
-                with ui.column().classes("gap-3 h-full").style("flex:0 0 70%;max-width:70%;"):
+        with ui.column().classes("w-full mx-auto p-3 gap-3"):
+            with ui.row().classes("w-full gap-3 items-stretch").style(
+                "min-height: calc(100vh - 120px); flex-wrap: nowrap; width: 100%;"
+            ):
+                with ui.column().classes("gap-3 h-full").style(
+                    "flex: 7 1 0%; min-width: 0;"
+                ):
                     self._build_canvas_section()
-                with ui.column().classes("h-full w-full").style("flex:1 1 30%;max-width:30%;"):
+                with ui.column().classes("h-full w-full gap-2").style(
+                    "flex: 3 1 0%; min-width: 0;"
+                ):
                     self._build_control_tabs()
         if self.state.selected_entity:
             self._select_entity(self.state.selected_entity)
@@ -227,19 +245,19 @@ class PlotterApp:
     # Canvas and overlay mock
     # ------------------------------------------------------------------
     def _build_canvas_section(self) -> None:
-        with ui.card().classes("flex-1 min-w-[340px] p-3 gap-3"):
-            with ui.row().classes("gap-2 flex-wrap items-center"):
-                ui.label("Plotting bed").classes("text-sm font-medium")
-                self.area_label = ui.label("").classes("text-xs text-gray-500")
-            with ui.row().classes("gap-2 flex-wrap items-center"):
-                ui.label("Jog & Controls").classes("text-xs uppercase tracking-wide text-gray-500")
+        with ui.card().classes("flex-1 min-w-[340px] p-2 gap-2"):
+            with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
+                ui.label("Plotting bed").classes("text-[11px] font-medium")
+                self.area_label = ui.label("").classes("text-[10px] text-gray-500")
+            with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
+                ui.label("Jog & Controls").classes("text-[10px] uppercase tracking-wide text-gray-500")
                 self._compact_button("Home", lambda: self._notify("Homed axes."))
                 self._compact_button("Sweep", lambda: self._notify("Swept rectangle."))
                 self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
                 self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
-                self.area_toggle = self._toggle_button("Toggle Area", self._toggle_area, self.show_area_overlay)
-                self.pattern_toggle = self._toggle_button("Toggle Pattern", self._toggle_pattern, self.show_pattern_overlay)
-                self.pots_toggle = self._toggle_button("Toggle Pots", self._toggle_pots, self.show_pots_overlay)
+                self.area_toggle = self._toggle_button("Area", self._toggle_area, self.show_area_overlay)
+                self.pattern_toggle = self._toggle_button("Pattern", self._toggle_pattern, self.show_pattern_overlay)
+                self.pots_toggle = self._toggle_button("Pots", self._toggle_pots, self.show_pots_overlay)
             self.canvas = ui.html(
                 content=self._render_canvas(),
                 sanitize=False,
@@ -251,50 +269,62 @@ class PlotterApp:
             self.canvas.on("pointermove", self._handle_canvas_pointer_move)
             self.canvas.on("pointerup", self._handle_canvas_pointer_up)
             self.canvas.on("pointerleave", self._handle_canvas_pointer_up)
-            with ui.row().classes("mt-1 gap-2 text-xs text-gray-500"):
+            with ui.row().classes("mt-1 gap-1 text-[10px] text-gray-500"):
                 ui.icon("touch_app").classes("text-primary")
                 ui.label("Click to jog corners or drag handles to reshape the work area.")
 
         with ui.column().classes("w-full gap-2"):
-            self.status_summary = ui.card().classes("p-3 text-xs font-medium bg-slate-100")
-            self.status_summary.set_text("Connected | COM3 @ 115200 | X=0.0 | Y=0.0 | Z=0.00 | Idle")
-            with ui.card().classes("p-3"):
-                ui.label("Recent activity").classes("text-xs font-medium text-gray-600 mb-2")
-                self.recent_status_container = ui.column().classes("gap-1 text-xs text-gray-700")
+            self.status_summary = ui.card().classes("p-2 bg-slate-100")
+            with self.status_summary:
+                self.status_summary_label = ui.label(
+                    "Connected | COM3 @ 115200 | X=0.0 | Y=0.0 | Z=0.00 | Idle"
+                ).classes("text-[11px] font-medium text-gray-800")
+
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Selection").classes("text-[11px] font-medium text-gray-600")
+                self.selection_label = ui.label("No selection").classes("text-[11px] text-gray-700")
+                ui.separator()
+                ui.label("Recent activity").classes("text-[11px] font-medium text-gray-600")
+                self.recent_status_container = ui.column().classes("gap-1 text-[11px] text-gray-700")
                 self._update_status_panels()
 
     def _build_control_tabs(self) -> None:
-        with ui.card().classes("w-full h-full p-0"):
-            with ui.tabs().classes("text-xs") as tabs:
-                tab_config = ui.tab("Config")
-                tab_area = ui.tab("Area")
-                tab_pots = ui.tab("Pots")
-                tab_console = ui.tab("Console")
-                tab_run = ui.tab("Run")
-            with ui.tab_panels(tabs, value=tab_config).classes("h-full"):
-                with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-3"):
-                    ui.label("Configuration options coming soon.").classes("text-xs text-gray-500")
-                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-3"):
+        with ui.card().classes("w-full h-full p-1"):
+            with ui.tabs().classes("text-[10px] flex gap-2 !px-0 w-full").style(
+                "flex-wrap: wrap; row-gap: 6px;"
+            ) as tabs:
+                tab_area = ui.tab("Area").classes("px-2 py-1 text-[10px]")
+                tab_load = ui.tab("Load").classes("px-2 py-1 text-[10px]")
+                tab_pots = ui.tab("Pots").classes("px-2 py-1 text-[10px]")
+                tab_console = ui.tab("Console").classes("px-2 py-1 text-[10px]")
+                tab_config = ui.tab("Config").classes("px-2 py-1 text-[10px]")
+                tab_run = ui.tab("Run").classes("px-2 py-1 text-[10px]")
+            with ui.tab_panels(tabs, value=tab_area).classes("h-full text-[11px]"):
+                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-2"):
                     self._build_area_controls()
-                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-3"):
+                with ui.tab_panel(tab_load).classes("h-full overflow-y-auto p-2"):
+                    self._build_load_tab()
+                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-2"):
                     self._build_pot_controls()
-                with ui.tab_panel(tab_console).classes("h-full overflow-y-auto p-3"):
+                with ui.tab_panel(tab_console).classes("h-full overflow-y-auto p-2"):
                     self._build_console_tab()
-                with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-3"):
-                    self._build_runner_panel()
+                with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-2"):
+                    self._build_config_tab()
+                with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-2"):
+                    self._build_run_tab()
 
     def _build_area_controls(self) -> None:
-        with ui.column().classes("gap-3"):
-            with ui.card().classes("p-3 gap-2"):
-                ui.label("Work Area Presets").classes("text-xs uppercase tracking-wide text-gray-500")
-                with ui.row().classes("gap-2 flex-wrap"):
+        with ui.column().classes("gap-2"):
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Work Area Presets").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                with ui.row().classes("gap-2 flex-wrap text-[11px]"):
                     self._compact_button("A4", lambda: self._quick_size("A4"))
                     self._compact_button("A5", lambda: self._quick_size("A5"))
                     self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
                     self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
                     self._compact_button("Reset Z Heights", self._reset_all_z_heights)
-            with ui.card().classes("p-3 gap-3 items-center"):
-                ui.label("Z Height").classes("text-xs uppercase tracking-wide text-gray-500")
+            with ui.card().classes("p-2 gap-3 items-center"):
+                ui.label("Z Height").classes("text-[10px] uppercase tracking-wide text-gray-500")
                 self.z_slider_container = ui.column().classes("items-center")
                 with self.z_slider_container:
                     self.z_slider = ui.slider(
@@ -306,8 +336,8 @@ class PlotterApp:
                     ).props("vertical reverse label-always").style("height:240px;width:2.2rem;")
 
     def _build_console_tab(self) -> None:
-        with ui.card().classes("p-3 gap-2"):
-            ui.label("G-code Console").classes("text-sm font-medium")
+        with ui.card().classes("p-2 gap-2"):
+            ui.label("G-code Console").classes("text-[12px] font-medium")
             console_input = ui.textarea(placeholder="Enter G-code commands...").props("autogrow")
             with ui.row().classes("gap-2"):
                 ui.button(
@@ -841,9 +871,9 @@ class PlotterApp:
     # Pot controls
     # ------------------------------------------------------------------
     def _build_pot_controls(self) -> None:
-        with ui.card().classes("flex-1 min-w-[320px] p-3 gap-3"):
-            ui.label("Color pots").classes("text-sm font-medium")
-            with ui.row().classes("gap-2 flex-wrap items-center"):
+        with ui.card().classes("flex-1 min-w-[320px] p-2 gap-2"):
+            ui.label("Color pots").classes("text-[12px] font-medium")
+            with ui.row().classes("gap-2 flex-wrap items-center text-[11px]"):
                 self._compact_button("+ Pot", self._add_pot, color="primary")
                 self._compact_button("Delete", self._remove_pot, color="negative")
                 self.color_picker = ui.color_input(value="#3a86ff", on_change=self._on_color_change).props(
@@ -856,58 +886,70 @@ class PlotterApp:
                 with_input=False,
                 on_change=self._on_pot_selected,
             ).props("label='Pot selection' dense")
-            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-xs text-gray-500")
+            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-[11px] text-gray-500")
 
     # ------------------------------------------------------------------
-    # Runner panel
+    # Configuration and run panels
     # ------------------------------------------------------------------
-    def _build_runner_panel(self) -> None:
-        with ui.card().classes("p-3 gap-3"):
-            ui.label("Renderer configuration").classes("text-sm font-medium")
+    def _build_config_tab(self) -> None:
+        with ui.card().classes("p-2 gap-2"):
+            ui.label("Renderer configuration").classes("text-[12px] font-medium")
             ui.toggle(options=["start", "centroid", "per_segment", "threshold"], value="per_segment").props(
                 "type=button unelevated toggle-color=primary label='z_mode'"
             )
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.number(label="z_threshold", value=0.02, min=0.0, max=1000.0, step=0.01)
                 ui.number(label="lift_delta", value=0.2, min=0.0, max=1.0, step=0.01)
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.number(label="settle_down_s", value=0.05, min=0.0, max=5.0, step=0.01)
                 ui.number(label="settle_up_s", value=0.03, min=0.0, max=5.0, step=0.01)
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.number(label="z_step", value=0.1, min=0.0, max=1.0, step=0.01)
                 ui.number(label="z_step_delay", value=0.03, min=0.0, max=1.0, step=0.005)
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.number(label="flush_every", value=200, min=1, step=10)
                 ui.number(label="feed_travel", value=15000, min=1, step=100)
 
             ui.separator()
-            ui.label("Run options").classes("text-sm font-medium")
-            with ui.row().classes("gap-3"):
+            ui.label("Run options").classes("text-[12px] font-medium")
+            with ui.row().classes("gap-2"):
                 ui.number(label="start_x", value=0.0, min=0.0, step=0.1)
                 ui.number(label="start_y", value=0.0, min=0.0, step=0.1)
                 ui.checkbox("optimize nn")
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.checkbox("combine endpoints", value=True)
                 ui.number(label="join_tol", value=0.05, min=0.0, step=0.01)
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.checkbox("resample", value=True)
                 ui.number(label="max_dev", value=0.1, min=0.0, step=0.01)
                 ui.input(label="max_seg (mm)")
 
-            ui.separator()
-            ui.label("Pen filter").classes("text-base font-medium")
+    def _build_run_tab(self) -> None:
+        with ui.card().classes("p-2 gap-2"):
+            ui.label("Pen filter").classes("text-[12px] font-medium")
             ui.select(options=[], with_input=False, multiple=True).props(
                 "hint='Populated after preview' label='Pens'"
             )
 
-            with ui.row().classes("gap-3"):
+            with ui.row().classes("gap-2"):
                 ui.button("Preview in overlay", color="info", on_click=lambda: self._notify("Preview requested."))
                 ui.button("Start", color="positive", on_click=lambda: self._notify("Run started."))
                 ui.button("Pause", on_click=lambda: self._notify("Run paused/resumed."))
                 ui.button("Stop", color="negative", on_click=lambda: self._notify("Run stopped."))
 
             self.progress = ui.linear_progress(value=0.0).props("color=primary")
-            self.progress_label = ui.label("Idle")
+            self.progress_label = ui.label("Idle").classes("text-[11px]")
+
+    def _build_load_tab(self) -> None:
+        with ui.card().classes("p-2 gap-2"):
+            ui.label("Load Patterns").classes("text-[12px] font-medium")
+            ui.button(
+                "Load Pattern",
+                on_click=lambda: self._notify("Pattern load dialog opened."),
+                color="primary",
+            ).props("unelevated size='sm'")
+            ui.button("Recent Patterns", on_click=lambda: self._notify("Opened recent patterns."))
+            ui.label("Additional import options coming soon.").classes("text-[11px] text-gray-500")
 
     # ------------------------------------------------------------------
     # Status area
@@ -930,12 +972,10 @@ class PlotterApp:
 
     def _log_status(self, message: str) -> None:
         self.state.log(message)
-        if self.status_log is not None:
-            self.status_log.push(message)
         self._update_status_panels()
 
     def _update_status_panels(self) -> None:
-        if self.status_summary is not None:
+        if self.status_summary_label is not None:
             device = self.state.serial_device or "COM3"
             x, y, z = self._current_position()
             progress_text = "Idle"
@@ -944,7 +984,7 @@ class PlotterApp:
             summary = (
                 f"Connected | {device} @ 115200 | X={x:.1f} | Y={y:.1f} | Z={z:.2f} | {progress_text}"
             )
-            self.status_summary.set_text(summary)
+            self.status_summary_label.set_text(summary)
         if self.recent_status_container is not None:
             self.recent_status_container.clear()
             recent = self.state.status_lines[-3:]
@@ -1203,4 +1243,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    ui.run(title="Pen Plotter Control Suite", show=False, reload=False)
+    ui.run(title="Pen Plotter Control Suite", show=False, reload=True)
