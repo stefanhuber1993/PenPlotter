@@ -94,6 +94,12 @@ class PlotterApp:
         if serial_device:
             self.state.log(f"Using serial device: {serial_device}")
 
+    def _compact_button(self, label: str, on_click, *, color: Optional[str] = None) -> ui.button:
+        button = ui.button(label, on_click=on_click, color=color)
+        button.props("unelevated dense size='sm'")
+        button.classes("px-2 py-1 text-xs")
+        return button
+
     def _apply_bed_size(self, bed_size: Tuple[float, float]) -> None:
         try:
             width, height = bed_size
@@ -147,27 +153,27 @@ class PlotterApp:
     # Layout builders
     # ------------------------------------------------------------------
     def create(self) -> None:
-        with ui.header().classes("items-center justify-between bg-primary text-white"):
-            with ui.row().classes("items-center gap-3"):
-                ui.label("Pen Plotter Control Suite").classes("text-xl font-semibold")
+        with ui.header().classes("items-center justify-between bg-primary text-white py-2 px-3"):
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Pen Plotter Control Suite").classes("text-lg font-semibold")
                 if self.state.serial_device:
                     ui.label(f"Device: {self.state.serial_device}").classes(
-                        "text-xs font-medium px-2 py-1 bg-white text-primary rounded"
+                        "text-xs font-medium px-2 py-0.5 bg-white text-primary rounded"
                     )
             self.workpiece_select = ui.select(
                 ["A4", "A5", "15 cm", "10 cm"],
                 value=self.state.workpiece,
                 on_change=self._on_workpiece_change,
-            ).props("label='Workpiece'")
+            ).props("label='Workpiece' dense")
 
-        with ui.column().classes("w-full max-w-screen-xl mx-auto p-6 gap-6"):
+        with ui.column().classes("w-full max-w-screen-lg mx-auto p-4 gap-4"):
             ui.label("Area setup, Z compensation, color pots, overlay preview, and run controls.").classes(
-                "text-lg text-gray-600"
+                "text-sm text-gray-600"
             )
-            with ui.row().classes("w-full items-start gap-6"):
+            with ui.row().classes("w-full items-start gap-4"):
                 self._build_canvas_section()
                 self._build_height_and_actions()
-            with ui.row().classes("w-full items-start gap-6"):
+            with ui.row().classes("w-full items-start gap-4"):
                 self._build_pot_controls()
                 self._build_runner_panel()
             self._build_status_area()
@@ -180,9 +186,15 @@ class PlotterApp:
     # Canvas and overlay mock
     # ------------------------------------------------------------------
     def _build_canvas_section(self) -> None:
-        with ui.card().classes("flex-1 min-w-[360px] p-4 gap-4"):
-            ui.label("Plotting bed").classes("text-base font-medium")
-            self.area_label = ui.label("").classes("text-sm text-gray-500")
+        with ui.card().classes("flex-1 min-w-[340px] p-3 gap-3"):
+            with ui.row().classes("gap-2 flex-wrap items-center"):
+                ui.label("Plotting bed").classes("text-sm font-medium")
+                self.area_label = ui.label("").classes("text-xs text-gray-500")
+            with ui.row().classes("gap-2 flex-wrap items-center"):
+                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."), color="primary")
+                self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
+                self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
+                self._compact_button("Home", lambda: self._notify("Homed axes."))
             self.canvas = ui.html(
                 content=self._render_canvas(),
                 sanitize=False,
@@ -193,7 +205,7 @@ class PlotterApp:
             self.canvas.on("pointermove", self._handle_canvas_pointer_move)
             self.canvas.on("pointerup", self._handle_canvas_pointer_up)
             self.canvas.on("pointerleave", self._handle_canvas_pointer_up)
-            with ui.row().classes("mt-2 gap-3 text-sm text-gray-500"):
+            with ui.row().classes("mt-1 gap-2 text-xs text-gray-500"):
                 ui.icon("touch_app").classes("text-primary")
                 ui.label("Click to jog corners or drag handles to reshape the work area.")
 
@@ -680,9 +692,9 @@ class PlotterApp:
     # Height slider and primary actions
     # ------------------------------------------------------------------
     def _build_height_and_actions(self) -> None:
-        with ui.column().classes("w-64 gap-4"):
-            with ui.card().classes("items-center p-4"):
-                ui.label("Z height").classes("font-medium")
+        with ui.column().classes("w-52 gap-3"):
+            with ui.card().classes("items-center p-3 gap-2"):
+                ui.label("Z height").classes("text-sm font-medium")
                 self.z_slider = ui.slider(
                     min=0.0,
                     max=1.0,
@@ -690,30 +702,25 @@ class PlotterApp:
                     value=self.state.z_height,
                     on_change=self._on_height_change,
                 ).props("vertical reverse label-always")
-            with ui.card().classes("p-4 gap-3"):
-                ui.label("Jog & Calibration").classes("font-medium")
-                ui.button("Sweep Rectangle", on_click=lambda: self._notify("Swept rectangle."), color="primary")
-                ui.button("Pen Up (1.0)", on_click=lambda: self._notify("Moved pen up."))
-                ui.button("Pen Down (0.0)", on_click=lambda: self._notify("Moved pen down."))
-                ui.button("Home (0,0)", on_click=lambda: self._notify("Homed axes."))
-            with ui.card().classes("p-4 gap-3"):
-                ui.label("Quick sizes").classes("font-medium")
-                ui.button("A4", on_click=lambda: self._quick_size("A4"))
-                ui.button("A5", on_click=lambda: self._quick_size("A5"))
-                ui.button("15 cm", on_click=lambda: self._quick_size("15 cm"))
-                ui.button("10 cm", on_click=lambda: self._quick_size("10 cm"))
+            with ui.card().classes("p-3 gap-2"):
+                ui.label("Quick sizes").classes("text-sm font-medium")
+                with ui.row().classes("gap-2 flex-wrap"):
+                    self._compact_button("A4", lambda: self._quick_size("A4"))
+                    self._compact_button("A5", lambda: self._quick_size("A5"))
+                    self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
+                    self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
 
     # ------------------------------------------------------------------
     # Pot controls
     # ------------------------------------------------------------------
     def _build_pot_controls(self) -> None:
-        with ui.card().classes("flex-1 min-w-[320px] p-4 gap-4"):
-            ui.label("Color pots").classes("text-base font-medium")
-            with ui.row().classes("gap-3"):
-                ui.button("+ Pot", on_click=self._add_pot, color="primary")
-                ui.button("Delete Pot", on_click=self._remove_pot, color="negative")
+        with ui.card().classes("flex-1 min-w-[320px] p-3 gap-3"):
+            ui.label("Color pots").classes("text-sm font-medium")
+            with ui.row().classes("gap-2 flex-wrap items-center"):
+                self._compact_button("+ Pot", self._add_pot, color="primary")
+                self._compact_button("Delete", self._remove_pot, color="negative")
                 self.color_picker = ui.color_input(value="#3a86ff", on_change=self._on_color_change).props(
-                    "label='Pot color'"
+                    "label='Pot color' dense"
                 )
                 self.color_picker.disable()
             self.pot_select = ui.select(
@@ -721,8 +728,8 @@ class PlotterApp:
                 value=None,
                 with_input=False,
                 on_change=self._on_pot_selected,
-            ).props("label='Pot selection'")
-            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-sm text-gray-500")
+            ).props("label='Pot selection' dense")
+            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-xs text-gray-500")
 
     # ------------------------------------------------------------------
     # Runner panel
@@ -793,7 +800,6 @@ class PlotterApp:
     # ------------------------------------------------------------------
     def _notify(self, message: str) -> None:
         self._log_status(message)
-        ui.notify(message)
 
     def _log_status(self, message: str) -> None:
         self.state.log(message)
@@ -873,7 +879,7 @@ class PlotterApp:
         width = min(width, self.state.bed_width)
         height = min(height, self.state.bed_height)
         min_x = max(0.0, (self.state.bed_width - width) / 2)
-        min_y = max(0.0, (self.state.bed_height - height) / 2)
+        min_y = 0.0
         self.state.rect_min = (min_x, min_y)
         self.state.rect_max = (min_x + width, min_y + height)
         self._update_canvas()
