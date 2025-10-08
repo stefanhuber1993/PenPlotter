@@ -239,11 +239,11 @@ class PlotterApp:
                 "min-height: calc(100vh - 120px); flex-wrap: nowrap; width: 100%;"
             ):
                 with ui.column().classes("gap-3 h-full").style(
-                    "flex: 7 1 0%; min-width: 0;"
+                    "flex: 1 1 auto; min-width: 360px; width: auto;"
                 ):
                     self._build_canvas_section()
                 with ui.column().classes("h-full w-full gap-2").style(
-                    "flex: 3 1 0%; min-width: 0;"
+                    "flex: 0 0 250px; width: 400px; max-width: 400px; min-width: 400px;"
                 ):
                     self._build_control_tabs()
         if self.state.selected_entity:
@@ -973,7 +973,7 @@ class PlotterApp:
             self.progress_label = ui.label("Idle").classes("text-[11px]")
 
     def _build_load_tab(self) -> None:
-        with ui.card().classes("p-2 gap-3"):
+        with ui.card().classes("p-2 gap-3 w-full"):
             ui.label("Import Pattern").classes("text-[12px] font-medium text-gray-700")
             with ui.row().classes("gap-2 items-center flex-wrap"):
                 ui.upload(
@@ -999,7 +999,7 @@ class PlotterApp:
                 ).props("outline size='sm'")
             self.pattern_summary_label = ui.label("No pattern loaded.").classes("text-[11px] text-gray-600")
 
-        with ui.card().classes("p-2 gap-2"):
+        with ui.card().classes("p-2 gap-2 w-full"):
             ui.label("Script Input").classes("text-[12px] font-medium text-gray-700")
             self.pattern_script_area = ui.textarea(
                 placeholder="Enter pattern script…",
@@ -1009,41 +1009,45 @@ class PlotterApp:
                 "(optional start_deg sweep_deg). Extra options: pen=<id> pressure=<float> feed=<mm/min>."
             ).classes("text-[10px] text-gray-500 leading-tight")
 
-        with ui.card().classes("p-2 gap-3"):
-            ui.label("Transform Pattern").classes("text-[12px] font-medium text-gray-700")
-            with ui.column().classes("gap-2"):
-                with ui.row().classes("gap-1 flex-wrap"):
-                    ui.label("Rotate (°)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+        with ui.card().classes("p-2 gap-3 w-full"):
+            ui.label("Transform Pattern").classes(
+                "text-[12px] font-semibold text-gray-700 text-center tracking-wide uppercase"
+            )
+            button_classes = "w-[36px] min-w-[36px] px-1 py-1 text-[10px]"
+            row_classes = "gap-1 w-full justify-evenly flex-nowrap"
+            with ui.column().classes("gap-3"):
+                ui.label("Rotate (°)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
                     for deg in (-90, -10, -1, 1, 10, 90):
                         label = f"{deg:+}°"
                         ui.button(
                             label,
                             on_click=lambda d=deg: self._rotate_pattern(d),
-                        ).props("size='sm' outline")
-                with ui.row().classes("gap-1 flex-wrap"):
-                    ui.label("Zoom (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
                     for pct in (-50, -10, -1, 1, 10, 100):
                         label = f"{pct:+}%"
                         ui.button(
                             label,
                             on_click=lambda p=pct: self._scale_pattern(p),
-                        ).props("size='sm' outline")
-                with ui.row().classes("gap-1 flex-wrap"):
-                    ui.label("Shift X (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Shift X (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
                     for offset in (-100, -10, -1, 1, 10, 100):
                         label = f"{offset:+}"
                         ui.button(
                             label,
                             on_click=lambda dx=offset: self._translate_pattern(dx, 0.0),
-                        ).props("size='sm' outline")
-                with ui.row().classes("gap-1 flex-wrap"):
-                    ui.label("Shift Y (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Shift Y (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
                     for offset in (-100, -10, -1, 1, 10, 100):
                         label = f"{offset:+}"
                         ui.button(
                             label,
                             on_click=lambda dy=offset: self._translate_pattern(0.0, dy),
-                        ).props("size='sm' outline")
+                        ).props("outline size='xs' dense").classes(button_classes)
 
     async def _handle_svg_upload(self, event: events.UploadEventArguments) -> None:
         uploads: List[Any] = []
@@ -1129,6 +1133,24 @@ class PlotterApp:
         for item in pattern.items:
             cloned = self._clone_pattern_item(item)
             sanitized.add(cloned)
+        bounds = self._pattern_bounds(sanitized)
+        if bounds is not None:
+            area_min_x, area_min_y = self.state.rect_min
+            area_max_x, area_max_y = self.state.rect_max
+            area_center_x = (area_min_x + area_max_x) / 2.0
+            area_center_y = (area_min_y + area_max_y) / 2.0
+            pattern_center_x, pattern_center_y = self._pattern_center(sanitized)
+            dx = area_center_x - pattern_center_x
+            dy = area_center_y - pattern_center_y
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                for item in sanitized.items:
+                    if isinstance(item, Polyline):
+                        item.pts = [(x + dx, y + dy) for x, y in item.pts]
+                    elif isinstance(item, Line):
+                        item.p0 = (item.p0[0] + dx, item.p0[1] + dy)
+                        item.p1 = (item.p1[0] + dx, item.p1[1] + dy)
+                    elif isinstance(item, Circle):
+                        item.c = (item.c[0] + dx, item.c[1] + dy)
         self.pattern = sanitized
         self.pattern_has_data = bool(self.pattern.items)
         self.pattern_name = source_name
@@ -1195,13 +1217,15 @@ class PlotterApp:
             )
         self.pattern_summary_label.set_text(summary)
 
-    def _pattern_bounds(self) -> Optional[Tuple[float, float, float, float]]:
+    def _pattern_bounds(self, pattern_obj: Optional[Pattern] = None) -> Optional[Tuple[float, float, float, float]]:
+        if pattern_obj is None:
+            pattern_obj = self.pattern
         min_x = float("inf")
         min_y = float("inf")
         max_x = float("-inf")
         max_y = float("-inf")
         found = False
-        for item in self.pattern.items:
+        for item in pattern_obj.items:
             if isinstance(item, Polyline):
                 points = item.pts
             elif isinstance(item, Line):
@@ -1220,8 +1244,8 @@ class PlotterApp:
             return None
         return min_x, min_y, max_x, max_y
 
-    def _pattern_center(self) -> Tuple[float, float]:
-        bounds = self._pattern_bounds()
+    def _pattern_center(self, pattern_obj: Optional[Pattern] = None) -> Tuple[float, float]:
+        bounds = self._pattern_bounds(pattern_obj)
         if bounds is None:
             return (0.0, 0.0)
         min_x, min_y, max_x, max_y = bounds
