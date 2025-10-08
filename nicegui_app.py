@@ -14,9 +14,14 @@ import os
 import math
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import re
+import xml.etree.ElementTree as ET
 
 from nicegui import events, ui
+
+from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS
 
 
 DEFAULT_BED_SIZE: Tuple[float, float] = (300.0, 245.0)
@@ -99,6 +104,11 @@ class PlotterApp:
         self.status_summary = None
         self.status_summary_label = None
         self.recent_status_container = None
+        self.pattern = Pattern()
+        self.pattern_name: str = "Empty"
+        self.pattern_summary_label = None
+        self.pattern_script_area = None
+        self.pattern_has_data = False
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -473,6 +483,26 @@ class PlotterApp:
                     f'</g>'
                 )
 
+        pattern_items: List[str] = []
+        if self.show_pattern_overlay and self.pattern.items:
+            for item in self.pattern.items:
+                if isinstance(item, Polyline):
+                    pts = list(reversed(item.pts)) if item._rev else list(item.pts)
+                elif isinstance(item, Line):
+                    pts = [item.p0, item.p1]
+                elif isinstance(item, Circle):
+                    pts = item.to_polyline().pts
+                else:
+                    continue
+                if len(pts) < 2:
+                    continue
+                canvas_pts = [self._world_to_canvas(px, py) for px, py in pts]
+                points_attr = " ".join(f"{cx:.1f},{cy:.1f}" for cx, cy in canvas_pts)
+                color = DEFAULT_PEN_COLORS.get(getattr(item, "pen_id", 0), "#2563eb")
+                pattern_items.append(
+                    f'<polyline points="{points_attr}" class="pattern-stroke" stroke="{color}" />'
+                )
+
         jog_items = []
         jog_layout = self._jog_button_layout(selected)
         for btn in jog_layout:
@@ -495,6 +525,7 @@ class PlotterApp:
           <defs>
             <style>
               .grid-line {{ stroke: #d1d5db; stroke-width: 1; }}
+              .pattern-stroke {{ fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }}
             </style>
           </defs>
           <rect x="{bed_left:.1f}" y="{bed_top:.1f}" width="{bed_width_px:.1f}" height="{bed_height_px:.1f}" fill="#f8fafc" stroke="#4b5563" stroke-width="2" rx="12" />
@@ -502,6 +533,7 @@ class PlotterApp:
             {''.join(vertical_lines)}
             {''.join(horizontal_lines)}
           </g>
+          {''.join(pattern_items)}
           {''.join(rect_items)}
           {''.join(corner_items)}
           {''.join(pot_items)}
@@ -941,15 +973,554 @@ class PlotterApp:
             self.progress_label = ui.label("Idle").classes("text-[11px]")
 
     def _build_load_tab(self) -> None:
+        with ui.card().classes("p-2 gap-3"):
+            ui.label("Import Pattern").classes("text-[12px] font-medium text-gray-700")
+            with ui.row().classes("gap-2 items-center flex-wrap"):
+                ui.upload(
+                    label="Upload SVG",
+                    auto_upload=True,
+                    on_upload=self._handle_svg_upload,
+                    max_file_size=5 * 1024 * 1024,
+                    multiple=False,
+                ).props("accept='.svg' color=primary outline dense")
+                ui.button(
+                    "Load Script",
+                    on_click=self._load_pattern_from_script,
+                    color="primary",
+                ).props("unelevated size='sm'")
+                ui.button(
+                    "Fill Example Script",
+                    on_click=self._populate_example_script,
+                ).props("size='sm'")
+                ui.button(
+                    "Clear Pattern",
+                    on_click=self._clear_pattern,
+                    color="negative",
+                ).props("outline size='sm'")
+            self.pattern_summary_label = ui.label("No pattern loaded.").classes("text-[11px] text-gray-600")
+
         with ui.card().classes("p-2 gap-2"):
-            ui.label("Load Patterns").classes("text-[12px] font-medium")
-            ui.button(
-                "Load Pattern",
-                on_click=lambda: self._notify("Pattern load dialog opened."),
-                color="primary",
-            ).props("unelevated size='sm'")
-            ui.button("Recent Patterns", on_click=lambda: self._notify("Opened recent patterns."))
-            ui.label("Additional import options coming soon.").classes("text-[11px] text-gray-500")
+            ui.label("Script Input").classes("text-[12px] font-medium text-gray-700")
+            self.pattern_script_area = ui.textarea(
+                placeholder="Enter pattern script…",
+            ).props("autogrow rows=6 dense")
+            ui.label(
+                "Commands: LINE x1 y1 x2 y2, POLYLINE x1 y1 x2 y2 ..., CIRCLE cx cy radius "
+                "(optional start_deg sweep_deg). Extra options: pen=<id> pressure=<float> feed=<mm/min>."
+            ).classes("text-[10px] text-gray-500 leading-tight")
+
+        with ui.card().classes("p-2 gap-3"):
+            ui.label("Transform Pattern").classes("text-[12px] font-medium text-gray-700")
+            with ui.column().classes("gap-2"):
+                with ui.row().classes("gap-1 flex-wrap"):
+                    ui.label("Rotate (°)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                    for deg in (-90, -10, -1, 1, 10, 90):
+                        label = f"{deg:+}°"
+                        ui.button(
+                            label,
+                            on_click=lambda d=deg: self._rotate_pattern(d),
+                        ).props("size='sm' outline")
+                with ui.row().classes("gap-1 flex-wrap"):
+                    ui.label("Zoom (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern(p),
+                        ).props("size='sm' outline")
+                with ui.row().classes("gap-1 flex-wrap"):
+                    ui.label("Shift X (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                    for offset in (-100, -10, -1, 1, 10, 100):
+                        label = f"{offset:+}"
+                        ui.button(
+                            label,
+                            on_click=lambda dx=offset: self._translate_pattern(dx, 0.0),
+                        ).props("size='sm' outline")
+                with ui.row().classes("gap-1 flex-wrap"):
+                    ui.label("Shift Y (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide")
+                    for offset in (-100, -10, -1, 1, 10, 100):
+                        label = f"{offset:+}"
+                        ui.button(
+                            label,
+                            on_click=lambda dy=offset: self._translate_pattern(0.0, dy),
+                        ).props("size='sm' outline")
+
+    async def _handle_svg_upload(self, event: events.UploadEventArguments) -> None:
+        uploads: List[Any] = []
+        if hasattr(event, "files") and event.files:
+            uploads = list(event.files)
+        elif hasattr(event, "file") and event.file:
+            uploads = [event.file]
+        data: Optional[bytes] = None
+        upload = uploads[0] if uploads else None
+        if upload is not None:
+            try:
+                if hasattr(upload, "read"):
+                    data = await upload.read()
+                elif hasattr(upload, "content"):
+                    data = upload.content
+            except Exception as exc:
+                ui.notify(f"Failed to read upload: {exc}", color="negative")
+                self._log_status(f"Upload read failed: {exc}")
+                return
+        if data is None and hasattr(event, "content") and event.content:
+            data = event.content
+        if data is None:
+            ui.notify("No file received.", color="warning")
+            return
+        try:
+            pattern = self._pattern_from_svg_bytes(data)
+        except ValueError as exc:
+            ui.notify(f"SVG import failed: {exc}", color="negative")
+            self._log_status(f"SVG import failed: {exc}")
+            return
+        filename = (
+            getattr(upload, "name", None)
+            or getattr(event, "name", None)
+            or "uploaded.svg"
+        )
+        self._set_pattern(pattern, filename)
+        ui.notify(f"Loaded {filename}", color="positive")
+        self._log_status(f"Loaded pattern from {filename}.")
+
+    def _clear_pattern(self) -> None:
+        self.pattern = Pattern()
+        self.pattern_has_data = False
+        self.pattern_name = "Empty"
+        self._update_pattern_summary()
+        self._update_canvas()
+        ui.notify("Pattern cleared.", color="info")
+        self._log_status("Cleared current pattern.")
+
+    def _populate_example_script(self) -> None:
+        example = (
+            "# Example pattern\n"
+            "LINE 0 0 120 0\n"
+            "LINE 120 0 120 80\n"
+            "LINE 120 80 0 80\n"
+            "LINE 0 80 0 0\n"
+            "POLYLINE 20 20 60 60 100 20\n"
+            "CIRCLE 60 40 18\n"
+        )
+        if self.pattern_script_area is not None:
+            self.pattern_script_area.set_value(example)
+        ui.notify("Example script inserted.", color="primary")
+
+    def _load_pattern_from_script(self) -> None:
+        if self.pattern_script_area is None:
+            ui.notify("Script area unavailable.", color="negative")
+            return
+        script_text = (self.pattern_script_area.value or "").strip()
+        if not script_text:
+            ui.notify("Script area is empty.", color="warning")
+            return
+        try:
+            pattern = self._parse_pattern_script(script_text)
+        except ValueError as exc:
+            ui.notify(f"Script error: {exc}", color="negative")
+            self._log_status(f"Pattern script failed: {exc}")
+            return
+        self._set_pattern(pattern, "Script import")
+        ui.notify("Script imported.", color="positive")
+        self._log_status("Loaded pattern from script.")
+
+    def _set_pattern(self, pattern: Pattern, source_name: str) -> None:
+        sanitized = Pattern()
+        for item in pattern.items:
+            cloned = self._clone_pattern_item(item)
+            sanitized.add(cloned)
+        self.pattern = sanitized
+        self.pattern_has_data = bool(self.pattern.items)
+        self.pattern_name = source_name
+        self._update_pattern_summary()
+        self._update_canvas()
+
+    def _clone_pattern_item(self, item: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
+        if isinstance(item, Polyline):
+            return Polyline(
+                pts=[(float(x), float(y)) for x, y in item.pts],
+                pen_pressure=float(item.pen_pressure),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        if isinstance(item, Line):
+            return Line(
+                p0=(float(item.p0[0]), float(item.p0[1])),
+                p1=(float(item.p1[0]), float(item.p1[1])),
+                pen_pressure=float(item.pen_pressure),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        if isinstance(item, Circle):
+            return Circle(
+                c=(float(item.c[0]), float(item.c[1])),
+                r=float(item.r),
+                start_deg=float(item.start_deg),
+                sweep_deg=float(item.sweep_deg),
+                pen_pressure=float(item.pen_pressure),
+                seg_len_mm=float(item.seg_len_mm),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        raise TypeError(f"Unsupported pattern item: {type(item).__name__}")
+
+    def _update_pattern_summary(self) -> None:
+        if self.pattern_summary_label is None:
+            return
+        if not self.pattern.items:
+            self.pattern_summary_label.set_text("No pattern loaded.")
+            return
+        bounds = self._pattern_bounds()
+        stroke_count = sum(
+            1
+            for it in self.pattern.items
+            if isinstance(it, Polyline) and len(it.pts) >= 2
+        )
+        if bounds is None:
+            summary = f"{self.pattern_name}: {stroke_count} strokes."
+        else:
+            min_x, min_y, max_x, max_y = bounds
+            width = max_x - min_x
+            height = max_y - min_y
+            summary = (
+                f"{self.pattern_name}: {stroke_count} strokes | "
+                f"bbox [{min_x:.1f}, {min_y:.1f}] – [{max_x:.1f}, {max_y:.1f}] "
+                f"({width:.1f} × {height:.1f} mm)"
+            )
+        self.pattern_summary_label.set_text(summary)
+
+    def _pattern_bounds(self) -> Optional[Tuple[float, float, float, float]]:
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        found = False
+        for item in self.pattern.items:
+            if isinstance(item, Polyline):
+                points = item.pts
+            elif isinstance(item, Line):
+                points = [item.p0, item.p1]
+            elif isinstance(item, Circle):
+                points = item.to_polyline().pts
+            else:
+                continue
+            for x, y in points:
+                min_x = min(min_x, float(x))
+                min_y = min(min_y, float(y))
+                max_x = max(max_x, float(x))
+                max_y = max(max_y, float(y))
+                found = True
+        if not found:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    def _pattern_center(self) -> Tuple[float, float]:
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            return (0.0, 0.0)
+        min_x, min_y, max_x, max_y = bounds
+        return (0.5 * (min_x + max_x), 0.5 * (min_y + max_y))
+
+    def _apply_pattern_transform(self, transformer: Callable[[float, float], Tuple[float, float]]) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        for item in self.pattern.items:
+            if isinstance(item, Polyline):
+                item.pts = [transformer(float(x), float(y)) for x, y in item.pts]
+        self._update_pattern_summary()
+        self._update_canvas()
+
+    def _rotate_pattern(self, degrees: float) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        cx, cy = self._pattern_center()
+        rad = math.radians(degrees)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            dx = x - cx
+            dy = y - cy
+            return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+        self._apply_pattern_transform(transform)
+        self._log_status(f"Rotated pattern by {degrees:+.1f}°.")
+
+    def _scale_pattern(self, percent: float) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        factor = 1.0 + percent / 100.0
+        if factor <= 0.01:
+            ui.notify("Scale too small; choose a larger value.", color="warning")
+            return
+        cx, cy = self._pattern_center()
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (cx + (x - cx) * factor, cy + (y - cy) * factor)
+
+        self._apply_pattern_transform(transform)
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern {change} by {percent:+.0f}%.")
+
+    def _translate_pattern(self, dx: float, dy: float) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (x + dx, y + dy)
+
+        self._apply_pattern_transform(transform)
+        self._log_status(f"Shifted pattern by Δx={dx:+.1f}, Δy={dy:+.1f}.")
+
+    def _parse_pattern_script(self, script_text: str) -> Pattern:
+        pattern = Pattern()
+        for line_number, raw_line in enumerate(script_text.splitlines(), start=1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            line = line.replace(",", " ")
+            tokens = [tok for tok in re.split(r"\s+", line) if tok]
+            if not tokens:
+                continue
+            command = tokens[0].lower()
+            args = tokens[1:]
+            numeric_values: List[float] = []
+            options: Dict[str, str] = {}
+            for token in args:
+                token_clean = token.strip().rstrip(",")
+                if "=" in token_clean:
+                    key, value = token_clean.split("=", 1)
+                    options[key.lower()] = value
+                else:
+                    try:
+                        numeric_values.append(float(token_clean))
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Line {line_number}: could not parse number '{token_clean}'."
+                        ) from exc
+
+            def apply_common(obj: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
+                if "pen" in options:
+                    obj.pen_id = int(float(options["pen"]))
+                if "pressure" in options:
+                    obj.pen_pressure = float(options["pressure"])
+                if "feed" in options:
+                    obj.feed_draw = int(float(options["feed"]))
+                if "name" in options:
+                    obj.name = options["name"]
+                return obj
+
+            if command == "line":
+                if len(numeric_values) < 4:
+                    raise ValueError(f"Line {line_number}: LINE requires 4 numbers.")
+                line_obj = Line(
+                    p0=(numeric_values[0], numeric_values[1]),
+                    p1=(numeric_values[2], numeric_values[3]),
+                )
+                pattern.add(apply_common(line_obj))
+            elif command == "polyline":
+                if len(numeric_values) < 4 or len(numeric_values) % 2 != 0:
+                    raise ValueError(
+                        f"Line {line_number}: POLYLINE requires an even number of coordinates (>=4)."
+                    )
+                points = [
+                    (numeric_values[i], numeric_values[i + 1]) for i in range(0, len(numeric_values), 2)
+                ]
+                poly_obj = Polyline(pts=points)
+                pattern.add(apply_common(poly_obj))
+            elif command == "circle":
+                if len(numeric_values) < 3:
+                    raise ValueError(f"Line {line_number}: CIRCLE requires center_x center_y radius.")
+                cx, cy, radius = numeric_values[:3]
+                start_deg = numeric_values[3] if len(numeric_values) >= 4 else 0.0
+                sweep_deg = numeric_values[4] if len(numeric_values) >= 5 else 360.0
+                circle_obj = Circle(c=(cx, cy), r=radius, start_deg=start_deg, sweep_deg=sweep_deg)
+                pattern.add(apply_common(circle_obj))
+            else:
+                raise ValueError(f"Line {line_number}: unknown command '{command}'.")
+        if not pattern.items:
+            raise ValueError("No drawing commands found in script.")
+        return pattern
+
+    def _pattern_from_svg_bytes(self, data: bytes) -> Pattern:
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as exc:
+            raise ValueError(f"Invalid SVG: {exc}") from exc
+
+        pattern = Pattern()
+
+        def traverse(element: ET.Element, transform: Tuple[float, float, float, float, float, float]) -> None:
+            current_transform = transform
+            if "transform" in element.attrib:
+                extra = self._parse_svg_transform(element.attrib["transform"])
+                current_transform = self._combine_transform(transform, extra)
+
+            tag = self._svg_tag_name(element.tag)
+            if tag == "line":
+                try:
+                    x1 = float(element.get("x1", "0"))
+                    y1 = float(element.get("y1", "0"))
+                    x2 = float(element.get("x2", "0"))
+                    y2 = float(element.get("y2", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid line coordinates in SVG: {exc}") from exc
+                p0 = self._apply_transform(current_transform, x1, y1)
+                p1 = self._apply_transform(current_transform, x2, y2)
+                pattern.add(Line(p0=p0, p1=p1))
+            elif tag in {"polyline", "polygon"}:
+                points_attr = element.get("points", "")
+                points = self._parse_svg_points(points_attr)
+                if tag == "polygon" and points and points[0] != points[-1]:
+                    points.append(points[0])
+                transformed = [self._apply_transform(current_transform, x, y) for x, y in points]
+                if len(transformed) >= 2:
+                    pattern.add(Polyline(pts=transformed))
+            elif tag == "circle":
+                try:
+                    cx = float(element.get("cx", "0"))
+                    cy = float(element.get("cy", "0"))
+                    r = float(element.get("r", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid circle in SVG: {exc}") from exc
+                base_circle = Circle(c=(cx, cy), r=r)
+                poly = base_circle.to_polyline()
+                transformed = [self._apply_transform(current_transform, x, y) for x, y in poly.pts]
+                pattern.add(Polyline(pts=transformed))
+            elif tag == "ellipse":
+                try:
+                    cx = float(element.get("cx", "0"))
+                    cy = float(element.get("cy", "0"))
+                    rx = float(element.get("rx", "0"))
+                    ry = float(element.get("ry", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid ellipse in SVG: {exc}") from exc
+                segments = 64
+                transformed = []
+                for k in range(segments + 1):
+                    theta = 2 * math.pi * k / segments
+                    x = cx + rx * math.cos(theta)
+                    y = cy + ry * math.sin(theta)
+                    transformed.append(self._apply_transform(current_transform, x, y))
+                pattern.add(Polyline(pts=transformed))
+
+            for child in element:
+                traverse(child, current_transform)
+
+        traverse(root, self._identity_transform())
+
+        if not pattern.items:
+            raise ValueError("No supported shapes found in SVG.")
+        return pattern
+
+    def _svg_tag_name(self, tag: str) -> str:
+        if "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def _parse_svg_points(self, points: str) -> List[Tuple[float, float]]:
+        raw_tokens = re.split(r"[,\s]+", points.strip())
+        values: List[float] = []
+        for tok in raw_tokens:
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                pass
+        paired = [
+            (values[i], values[i + 1])
+            for i in range(0, len(values) - 1, 2)
+        ]
+        return paired
+
+    def _identity_transform(self) -> Tuple[float, float, float, float, float, float]:
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    def _combine_transform(
+        self,
+        base: Tuple[float, float, float, float, float, float],
+        extra: Tuple[float, float, float, float, float, float],
+    ) -> Tuple[float, float, float, float, float, float]:
+        a1, b1, c1, d1, e1, f1 = base
+        a2, b2, c2, d2, e2, f2 = extra
+        return (
+            a1 * a2 + c1 * b2,
+            b1 * a2 + d1 * b2,
+            a1 * c2 + c1 * d2,
+            b1 * c2 + d1 * d2,
+            a1 * e2 + c1 * f2 + e1,
+            b1 * e2 + d1 * f2 + f1,
+        )
+
+    def _apply_transform(
+        self,
+        transform: Tuple[float, float, float, float, float, float],
+        x: float,
+        y: float,
+    ) -> Tuple[float, float]:
+        a, b, c, d, e, f = transform
+        return (a * x + c * y + e, b * x + d * y + f)
+
+    def _parse_svg_transform(self, transform_text: str) -> Tuple[float, float, float, float, float, float]:
+        transform_text = transform_text.strip()
+        if not transform_text:
+            return self._identity_transform()
+        pattern_re = re.compile(r"([a-zA-Z]+)\s*\(([^)]*)\)")
+        result = self._identity_transform()
+        for name, args_text in pattern_re.findall(transform_text):
+            params = [
+                float(p)
+                for p in re.split(r"[,\s]+", args_text.strip())
+                if p.strip()
+            ]
+            name = name.lower()
+            if name == "translate":
+                tx = params[0] if params else 0.0
+                ty = params[1] if len(params) > 1 else 0.0
+                matrix = (1.0, 0.0, 0.0, 1.0, tx, ty)
+            elif name == "scale":
+                sx = params[0] if params else 1.0
+                sy = params[1] if len(params) > 1 else sx
+                matrix = (sx, 0.0, 0.0, sy, 0.0, 0.0)
+            elif name == "rotate":
+                angle = params[0] if params else 0.0
+                rad = math.radians(angle)
+                cos_a = math.cos(rad)
+                sin_a = math.sin(rad)
+                if len(params) >= 3:
+                    cx, cy = params[1], params[2]
+                    matrix = self._combine_transform(
+                        self._combine_transform(
+                            (1.0, 0.0, 0.0, 1.0, cx, cy),
+                            (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0),
+                        ),
+                        (1.0, 0.0, 0.0, 1.0, -cx, -cy),
+                    )
+                else:
+                    matrix = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+            elif name == "skewx":
+                angle = params[0] if params else 0.0
+                matrix = (1.0, 0.0, math.tan(math.radians(angle)), 1.0, 0.0, 0.0)
+            elif name == "skewy":
+                angle = params[0] if params else 0.0
+                matrix = (1.0, math.tan(math.radians(angle)), 0.0, 1.0, 0.0, 0.0)
+            elif name == "matrix" and len(params) >= 6:
+                matrix = tuple(params[:6])  # type: ignore
+            else:
+                matrix = self._identity_transform()
+            result = self._combine_transform(result, matrix)
+        return result
 
     # ------------------------------------------------------------------
     # Status area
