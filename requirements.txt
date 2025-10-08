@@ -1,0 +1,5 @@
+nicegui>=1.4.12
+fastapi>=0.110
+uvicorn[standard]>=0.23
+svgpathtools>=1.5.1
+pyserial>=3.5
