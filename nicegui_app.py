@@ -191,46 +191,20 @@ class PlotterApp:
                 ui.label("Plotting bed").classes("text-sm font-medium")
                 self.area_label = ui.label("").classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 flex-wrap items-center"):
-                with ui.column().classes("gap-1"):
-                    ui.label("Jog & Calibration").classes("text-xs uppercase tracking-wide text-gray-500")
-                    with ui.row().classes("gap-2 flex-wrap items-center"):
-                        self._compact_button("Sweep", lambda: self._notify("Swept rectangle."), color="primary")
-                        self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
-                        self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
-                        self._compact_button("Home", lambda: self._notify("Homed axes."))
-                with ui.column().classes("gap-1"):
-                    ui.label("Work Area Presets").classes("text-xs uppercase tracking-wide text-gray-500")
-                    with ui.row().classes("gap-2 flex-wrap items-center"):
-                        self._compact_button("A4", lambda: self._quick_size("A4"))
-                        self._compact_button("A5", lambda: self._quick_size("A5"))
-                        self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
-                        self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
-            with ui.row().classes("gap-2 items-stretch"):
-                self.canvas = ui.html(
-                    content=self._render_canvas(),
-                    sanitize=False,
-                ).classes("rounded-lg border bg-slate-50").style(
-                    f"width:{self.canvas_size[0]}px;height:{self.canvas_size[1]}px;touch-action:none;cursor:crosshair;"
-                )
-                self.canvas.on("pointerdown", self._handle_canvas_pointer_down)
-                self.canvas.on("pointermove", self._handle_canvas_pointer_move)
-                self.canvas.on("pointerup", self._handle_canvas_pointer_up)
-                self.canvas.on("pointerleave", self._handle_canvas_pointer_up)
-                with ui.column().classes("items-center gap-2").style(
-                    f"height:{self.canvas_size[1]}px;"
-                ):
-                    ui.label("Z Height").classes(
-                        "text-xs uppercase tracking-wide text-gray-500"
-                    ).style("writing-mode:vertical-rl;transform:rotate(180deg);")
-                    self.z_slider = ui.slider(
-                        min=0.0,
-                        max=1.0,
-                        step=0.01,
-                        value=self.state.z_height,
-                        on_change=self._on_height_change,
-                    ).props("vertical reverse label-always").classes("flex-1 self-stretch").style(
-                        "width:2.2rem;"
-                    )
+                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."), color="primary")
+                self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
+                self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
+                self._compact_button("Home", lambda: self._notify("Homed axes."))
+            self.canvas = ui.html(
+                content=self._render_canvas(),
+                sanitize=False,
+            ).classes("rounded-lg border bg-slate-50").style(
+                f"width:{self.canvas_size[0]}px;height:{self.canvas_size[1]}px;touch-action:none;cursor:crosshair;"
+            )
+            self.canvas.on("pointerdown", self._handle_canvas_pointer_down)
+            self.canvas.on("pointermove", self._handle_canvas_pointer_move)
+            self.canvas.on("pointerup", self._handle_canvas_pointer_up)
+            self.canvas.on("pointerleave", self._handle_canvas_pointer_up)
             with ui.row().classes("mt-1 gap-2 text-xs text-gray-500"):
                 ui.icon("touch_app").classes("text-primary")
                 ui.label("Click to jog corners or drag handles to reshape the work area.")
@@ -718,8 +692,23 @@ class PlotterApp:
     # Height slider and primary actions
     # ------------------------------------------------------------------
     def _build_height_and_actions(self) -> None:
-        with ui.column().classes("w-48 gap-3"):
-            pass
+        with ui.column().classes("w-52 gap-3"):
+            with ui.card().classes("items-center p-3 gap-2"):
+                ui.label("Z height").classes("text-sm font-medium")
+                self.z_slider = ui.slider(
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    value=self.state.z_height,
+                    on_change=self._on_height_change,
+                ).props("vertical reverse label-always")
+            with ui.card().classes("p-3 gap-2"):
+                ui.label("Quick sizes").classes("text-sm font-medium")
+                with ui.row().classes("gap-2 flex-wrap"):
+                    self._compact_button("A4", lambda: self._quick_size("A4"))
+                    self._compact_button("A5", lambda: self._quick_size("A5"))
+                    self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
+                    self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
 
     # ------------------------------------------------------------------
     # Pot controls
