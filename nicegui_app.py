@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from nicegui import events, ui
 
+
 DEFAULT_BED_SIZE: Tuple[float, float] = (300.0, 245.0)
 DEFAULT_RECT_SIZE: Tuple[float, float] = (300.0, 245.0)
 APP_CONFIG: Dict[str, Any] = {"serial_device": None, "bed_size": DEFAULT_BED_SIZE}
@@ -82,13 +83,21 @@ class PlotterApp:
         self.canvas = None
         self.canvas_element = None
         self.canvas_size = (700, 600)
-        self.canvas_margin = 44
+        self.canvas_margin = 32
         self._last_pointer_pos: Optional[Tuple[float, float]] = None
         self.z_slider = None
         self._suppress_height_event = False
         self._suppress_color_event = False
         self.area_label = None
         self._suppress_pot_event = False
+        self.show_area_overlay = True
+        self.show_pattern_overlay = True
+        self.show_pots_overlay = True
+        self.area_toggle = None
+        self.pattern_toggle = None
+        self.pots_toggle = None
+        self.status_summary = None
+        self.recent_status_container = None
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -99,6 +108,17 @@ class PlotterApp:
         button.props("unelevated dense size='sm'")
         button.classes("px-2 py-1 text-xs")
         return button
+
+    def _toggle_button(self, label: str, handler, state: bool) -> ui.button:
+        button = ui.button(label, on_click=handler).props("unelevated size='sm'")
+        button.classes("px-2 py-1 text-xs rounded transition-colors duration-150")
+        self._apply_toggle_style(button, state)
+        return button
+
+    @staticmethod
+    def _apply_toggle_style(button: ui.button, state: bool) -> None:
+        button.classes(remove="toggle-btn-active toggle-btn-inactive")
+        button.classes(add="toggle-btn-active" if state else "toggle-btn-inactive")
 
     def _apply_bed_size(self, bed_size: Tuple[float, float]) -> None:
         try:
@@ -122,6 +142,32 @@ class PlotterApp:
             f"Initial work area set to {rect_width:.0f} × {rect_height:.0f} mm within bed "
             f"{self.state.bed_width:.0f} × {self.state.bed_height:.0f} mm."
         )
+
+    def _toggle_area(self) -> None:
+        self.show_area_overlay = not self.show_area_overlay
+        self._apply_toggle_style(self.area_toggle, self.show_area_overlay)
+        if not self.show_area_overlay:
+            if self.state.selected_entity and self.state.selected_entity[0] == "corner":
+                self.state.selected_entity = None
+            self._update_selection_label()
+        else:
+            self._select_entity(("corner", "BL"))
+        self._update_canvas()
+
+    def _toggle_pattern(self) -> None:
+        self.show_pattern_overlay = not self.show_pattern_overlay
+        self._apply_toggle_style(self.pattern_toggle, self.show_pattern_overlay)
+        self._update_canvas()
+
+    def _toggle_pots(self) -> None:
+        self.show_pots_overlay = not self.show_pots_overlay
+        self._apply_toggle_style(self.pots_toggle, self.show_pots_overlay)
+        if not self.show_pots_overlay:
+            self.state.selected_pot_id = None
+            if self.state.selected_entity and self.state.selected_entity[0] == "pot":
+                self.state.selected_entity = None
+            self._update_selection_label()
+        self._update_canvas()
 
     def _normalize_entity(
         self, entity: Optional[Tuple[str, Union[str, int]]]
@@ -166,17 +212,12 @@ class PlotterApp:
                 on_change=self._on_workpiece_change,
             ).props("label='Workpiece' dense")
 
-        with ui.column().classes("w-full max-w-screen-lg mx-auto p-4 gap-4"):
-            ui.label("Area setup, Z compensation, color pots, overlay preview, and run controls.").classes(
-                "text-sm text-gray-600"
-            )
-            with ui.row().classes("w-full items-start gap-4"):
-                self._build_canvas_section()
-                self._build_height_and_actions()
-            with ui.row().classes("w-full items-start gap-4"):
-                self._build_pot_controls()
-                self._build_runner_panel()
-            self._build_status_area()
+        with ui.column().classes("w-full mx-auto p-4 gap-4"):
+            with ui.row().classes("w-full gap-4 items-stretch flex-nowrap").style("min-height: calc(100vh - 140px);"):
+                with ui.column().classes("gap-3 h-full").style("flex:0 0 70%;max-width:70%;"):
+                    self._build_canvas_section()
+                with ui.column().classes("h-full w-full").style("flex:1 1 30%;max-width:30%;"):
+                    self._build_control_tabs()
         if self.state.selected_entity:
             self._select_entity(self.state.selected_entity)
         else:
@@ -191,15 +232,20 @@ class PlotterApp:
                 ui.label("Plotting bed").classes("text-sm font-medium")
                 self.area_label = ui.label("").classes("text-xs text-gray-500")
             with ui.row().classes("gap-2 flex-wrap items-center"):
-                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."), color="primary")
+                ui.label("Jog & Controls").classes("text-xs uppercase tracking-wide text-gray-500")
+                self._compact_button("Home", lambda: self._notify("Homed axes."))
+                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."))
                 self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
                 self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
-                self._compact_button("Home", lambda: self._notify("Homed axes."))
+                self.area_toggle = self._toggle_button("Toggle Area", self._toggle_area, self.show_area_overlay)
+                self.pattern_toggle = self._toggle_button("Toggle Pattern", self._toggle_pattern, self.show_pattern_overlay)
+                self.pots_toggle = self._toggle_button("Toggle Pots", self._toggle_pots, self.show_pots_overlay)
             self.canvas = ui.html(
                 content=self._render_canvas(),
                 sanitize=False,
-            ).classes("rounded-lg border bg-slate-50").style(
-                f"width:{self.canvas_size[0]}px;height:{self.canvas_size[1]}px;touch-action:none;cursor:crosshair;"
+            ).classes("rounded-lg border bg-slate-50 w-full").style(
+                f"width:100%; aspect-ratio:{self.state.bed_width}/{self.state.bed_height};"
+                "touch-action:none;cursor:crosshair;"
             )
             self.canvas.on("pointerdown", self._handle_canvas_pointer_down)
             self.canvas.on("pointermove", self._handle_canvas_pointer_move)
@@ -208,6 +254,68 @@ class PlotterApp:
             with ui.row().classes("mt-1 gap-2 text-xs text-gray-500"):
                 ui.icon("touch_app").classes("text-primary")
                 ui.label("Click to jog corners or drag handles to reshape the work area.")
+
+        with ui.column().classes("w-full gap-2"):
+            self.status_summary = ui.card().classes("p-3 text-xs font-medium bg-slate-100")
+            self.status_summary.set_text("Connected | COM3 @ 115200 | X=0.0 | Y=0.0 | Z=0.00 | Idle")
+            with ui.card().classes("p-3"):
+                ui.label("Recent activity").classes("text-xs font-medium text-gray-600 mb-2")
+                self.recent_status_container = ui.column().classes("gap-1 text-xs text-gray-700")
+                self._update_status_panels()
+
+    def _build_control_tabs(self) -> None:
+        with ui.card().classes("w-full h-full p-0"):
+            with ui.tabs().classes("text-xs") as tabs:
+                tab_config = ui.tab("Config")
+                tab_area = ui.tab("Area")
+                tab_pots = ui.tab("Pots")
+                tab_console = ui.tab("Console")
+                tab_run = ui.tab("Run")
+            with ui.tab_panels(tabs, value=tab_config).classes("h-full"):
+                with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-3"):
+                    ui.label("Configuration options coming soon.").classes("text-xs text-gray-500")
+                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-3"):
+                    self._build_area_controls()
+                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-3"):
+                    self._build_pot_controls()
+                with ui.tab_panel(tab_console).classes("h-full overflow-y-auto p-3"):
+                    self._build_console_tab()
+                with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-3"):
+                    self._build_runner_panel()
+
+    def _build_area_controls(self) -> None:
+        with ui.column().classes("gap-3"):
+            with ui.card().classes("p-3 gap-2"):
+                ui.label("Work Area Presets").classes("text-xs uppercase tracking-wide text-gray-500")
+                with ui.row().classes("gap-2 flex-wrap"):
+                    self._compact_button("A4", lambda: self._quick_size("A4"))
+                    self._compact_button("A5", lambda: self._quick_size("A5"))
+                    self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
+                    self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
+                    self._compact_button("Reset Z Heights", self._reset_all_z_heights)
+            with ui.card().classes("p-3 gap-3 items-center"):
+                ui.label("Z Height").classes("text-xs uppercase tracking-wide text-gray-500")
+                self.z_slider_container = ui.column().classes("items-center")
+                with self.z_slider_container:
+                    self.z_slider = ui.slider(
+                        min=0.0,
+                        max=1.0,
+                        step=0.01,
+                        value=self.state.z_height,
+                        on_change=self._on_height_change,
+                    ).props("vertical reverse label-always").style("height:240px;width:2.2rem;")
+
+    def _build_console_tab(self) -> None:
+        with ui.card().classes("p-3 gap-2"):
+            ui.label("G-code Console").classes("text-sm font-medium")
+            console_input = ui.textarea(placeholder="Enter G-code commands...").props("autogrow")
+            with ui.row().classes("gap-2"):
+                ui.button(
+                    "Send",
+                    on_click=lambda: self._log_status(f"Sent G-code: {console_input.value.strip()}"),
+                    color="primary",
+                ).props("unelevated size='sm'")
+                ui.button("Clear", on_click=lambda: console_input.set_value("")).props("unelevated size='sm'")
 
     def _canvas_transform(self) -> Tuple[float, float, float]:
         inner_width = self.canvas_size[0] - 2 * self.canvas_margin
@@ -278,16 +386,22 @@ class PlotterApp:
             )
             y += tick
 
-        rect_min_x, rect_min_y = self.state.rect_min
-        rect_max_x, rect_max_y = self.state.rect_max
-        rect_left, rect_bottom = self._world_to_canvas(rect_min_x, rect_min_y)
-        rect_right, rect_top = self._world_to_canvas(rect_max_x, rect_max_y)
-        rect_x = rect_left
-        rect_y = rect_top
-        rect_width = max(1.0, rect_right - rect_left)
-        rect_height = max(1.0, rect_bottom - rect_top)
+        rect_items: List[str] = []
+        corner_items: List[str] = []
+        if self.show_area_overlay:
+            rect_min_x, rect_min_y = self.state.rect_min
+            rect_max_x, rect_max_y = self.state.rect_max
+            rect_left, rect_bottom = self._world_to_canvas(rect_min_x, rect_min_y)
+            rect_right, rect_top = self._world_to_canvas(rect_max_x, rect_max_y)
+            rect_x = rect_left
+            rect_y = rect_top
+            rect_width = max(1.0, rect_right - rect_left)
+            rect_height = max(1.0, rect_bottom - rect_top)
+            rect_items.append(
+                f'<rect x="{rect_x:.1f}" y="{rect_y:.1f}" width="{rect_width:.1f}" height="{rect_height:.1f}" '
+                f'fill="rgba(37, 99, 235, 0.08)" stroke="#2563eb" stroke-width="2" />'
+            )
 
-        corner_items = []
         label_offsets = {
             "BL": (-16, 20),
             "BR": (16, 20),
@@ -295,37 +409,39 @@ class PlotterApp:
             "TR": (16, -16),
         }
         selected = self.state.selected_entity
-        for key in ["BL", "BR", "TL", "TR"]:
-            cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
-            is_selected = selected == ("corner", key)
-            corner_items.append(
-                f'<g>'
-                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{10 if is_selected else 8}" '
-                f'stroke="#2563eb" stroke-width="{3 if is_selected else 2}" fill="#fff" />'
-                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4}" fill="#2563eb" />'
-                f'</g>'
-            )
-            offset_x, offset_y = label_offsets[key]
-            label_x = cx + offset_x
-            label_y = cy + offset_y
-            corner_items.append(
-                f'<text x="{label_x:.1f}" y="{label_y:.1f}" '
-                f'font-size="12" text-anchor="middle" fill="#1f2937">{self.state.corner_heights[key]:.2f}</text>'
-            )
+        if self.show_area_overlay:
+            for key in ["BL", "BR", "TL", "TR"]:
+                cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
+                is_selected = selected == ("corner", key)
+                corner_items.append(
+                    f'<g>'
+                    f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{10 if is_selected else 8}" '
+                    f'stroke="#2563eb" stroke-width="{3 if is_selected else 2}" fill="#fff" />'
+                    f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4}" fill="#2563eb" />'
+                    f'</g>'
+                )
+                offset_x, offset_y = label_offsets[key]
+                label_x = cx + offset_x
+                label_y = cy + offset_y
+                corner_items.append(
+                    f'<text x="{label_x:.1f}" y="{label_y:.1f}" '
+                    f'font-size="12" text-anchor="middle" fill="#1f2937">{self.state.corner_heights[key]:.2f}</text>'
+                )
 
         pot_items = []
-        for pot in self.state.pots:
-            px, py = self._world_to_canvas(*pot.position)
-            is_selected = selected == ("pot", pot.identifier)
-            radius = 12 if is_selected else 10
-            pot_items.append(
-                f'<g>'
-                f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" fill="{pot.color}" '
-                f'stroke="#1f2937" stroke-width="{2 if is_selected else 1.5}" />'
-                f'<text x="{px:.1f}" y="{py + radius + 14:.1f}" font-size="11" '
-                f'text-anchor="middle" fill="#1f2937">Pot {pot.identifier}</text>'
-                f'</g>'
-            )
+        if self.show_pots_overlay:
+            for pot in self.state.pots:
+                px, py = self._world_to_canvas(*pot.position)
+                is_selected = selected == ("pot", pot.identifier)
+                radius = 12 if is_selected else 10
+                pot_items.append(
+                    f'<g>'
+                    f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" fill="{pot.color}" '
+                    f'stroke="#1f2937" stroke-width="{2 if is_selected else 1.5}" />'
+                    f'<text x="{px:.1f}" y="{py + radius + 14:.1f}" font-size="11" '
+                    f'text-anchor="middle" fill="#1f2937">Pot {pot.identifier}</text>'
+                    f'</g>'
+                )
 
         jog_items = []
         jog_layout = self._jog_button_layout(selected)
@@ -356,7 +472,7 @@ class PlotterApp:
             {''.join(vertical_lines)}
             {''.join(horizontal_lines)}
           </g>
-          <rect x="{rect_x:.1f}" y="{rect_y:.1f}" width="{rect_width:.1f}" height="{rect_height:.1f}" fill="rgba(37, 99, 235, 0.08)" stroke="#2563eb" stroke-width="2" />
+          {''.join(rect_items)}
           {''.join(corner_items)}
           {''.join(pot_items)}
           {''.join(jog_items)}
@@ -372,10 +488,14 @@ class PlotterApp:
             return None
         kind, key = normalized
         if kind == "corner":
+            if not self.show_area_overlay:
+                return None
             cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
             radius = 10.0
             return cx, cy, radius
         if kind == "pot":
+            if not self.show_pots_overlay:
+                return None
             pot = next((p for p in self.state.pots if p.identifier == key), None)
             if pot is None:
                 return None
@@ -387,6 +507,11 @@ class PlotterApp:
     def _jog_button_layout(self, entity: Optional[Tuple[str, Union[str, int]]]) -> List[Dict[str, float | str]]:
         if not self._is_entity_draggable(entity):
             return []
+        if isinstance(entity, tuple):
+            if entity[0] == "corner" and not self.show_area_overlay:
+                return []
+            if entity[0] == "pot" and not self.show_pots_overlay:
+                return []
         position = self._get_entity_canvas_position(entity)
         if position is None:
             return []
@@ -443,14 +568,16 @@ class PlotterApp:
         self._update_area_label()
 
     def _hit_test_canvas(self, cx: float, cy: float) -> Optional[Tuple[str, Union[str, int]]]:
-        for key in ["BL", "BR", "TL", "TR"]:
-            hx, hy = self._world_to_canvas(*self._corner_world_coords(key))
-            if math.hypot(cx - hx, cy - hy) <= 14:
-                return ("corner", key)
-        for pot in reversed(self.state.pots):
-            px, py = self._world_to_canvas(*pot.position)
-            if math.hypot(cx - px, cy - py) <= 16:
-                return ("pot", pot.identifier)
+        if self.show_area_overlay:
+            for key in ["BL", "BR", "TL", "TR"]:
+                hx, hy = self._world_to_canvas(*self._corner_world_coords(key))
+                if math.hypot(cx - hx, cy - hy) <= 14:
+                    return ("corner", key)
+        if self.show_pots_overlay:
+            for pot in reversed(self.state.pots):
+                px, py = self._world_to_canvas(*pot.position)
+                if math.hypot(cx - px, cy - py) <= 16:
+                    return ("pot", pot.identifier)
         return None
 
     def _hit_test_jog(self, cx: float, cy: float) -> Optional[Dict[str, Union[float, Tuple[str, Union[str, int]]]]]:
@@ -735,8 +862,8 @@ class PlotterApp:
     # Runner panel
     # ------------------------------------------------------------------
     def _build_runner_panel(self) -> None:
-        with ui.card().classes("flex-1 min-w-[360px] p-4 gap-4"):
-            ui.label("Renderer configuration").classes("text-base font-medium")
+        with ui.card().classes("p-3 gap-3"):
+            ui.label("Renderer configuration").classes("text-sm font-medium")
             ui.toggle(options=["start", "centroid", "per_segment", "threshold"], value="per_segment").props(
                 "type=button unelevated toggle-color=primary label='z_mode'"
             )
@@ -754,7 +881,7 @@ class PlotterApp:
                 ui.number(label="feed_travel", value=15000, min=1, step=100)
 
             ui.separator()
-            ui.label("Run options").classes("text-base font-medium")
+            ui.label("Run options").classes("text-sm font-medium")
             with ui.row().classes("gap-3"):
                 ui.number(label="start_x", value=0.0, min=0.0, step=0.1)
                 ui.number(label="start_y", value=0.0, min=0.0, step=0.1)
@@ -786,11 +913,11 @@ class PlotterApp:
     # Status area
     # ------------------------------------------------------------------
     def _build_status_area(self) -> None:
-        with ui.card().classes("w-full p-4 gap-4"):
-            ui.label("Selection").classes("text-base font-medium")
-            self.selection_label = ui.label("")
-            ui.label("Status").classes("text-base font-medium")
-            self.status_log = ui.log(max_lines=200)
+        with ui.card().classes("w-full p-3 gap-2"):
+            ui.label("Selection").classes("text-sm font-medium")
+            self.selection_label = ui.label("").classes("text-xs")
+            ui.label("Status").classes("text-sm font-medium")
+            self.status_log = ui.log(max_lines=200).classes("text-xs")
             for line in self.state.status_lines:
                 self.status_log.push(line)
         self._update_selection_label()
@@ -805,6 +932,40 @@ class PlotterApp:
         self.state.log(message)
         if self.status_log is not None:
             self.status_log.push(message)
+        self._update_status_panels()
+
+    def _update_status_panels(self) -> None:
+        if self.status_summary is not None:
+            device = self.state.serial_device or "COM3"
+            x, y, z = self._current_position()
+            progress_text = "Idle"
+            if self.progress is not None and self.progress.value and self.progress.value > 0.0:
+                progress_text = f"Running ({self.progress.value * 100:.0f}%)"
+            summary = (
+                f"Connected | {device} @ 115200 | X={x:.1f} | Y={y:.1f} | Z={z:.2f} | {progress_text}"
+            )
+            self.status_summary.set_text(summary)
+        if self.recent_status_container is not None:
+            self.recent_status_container.clear()
+            recent = self.state.status_lines[-3:]
+            with self.recent_status_container:
+                for entry in recent:
+                    ui.label(entry).classes("text-xs text-gray-700")
+
+    def _current_position(self) -> Tuple[float, float, float]:
+        entity = self.state.selected_entity
+        if entity:
+            kind, key = entity
+            if kind == "corner" and key in {"BL", "BR", "TL", "TR"}:
+                x, y = self._corner_world_coords(key)
+                z = self.state.corner_heights.get(str(key), self.state.z_height)
+                return x, y, z
+            if kind == "pot":
+                pot = next((p for p in self.state.pots if p.identifier == key), None)
+                if pot:
+                    x, y = pot.position
+                    return x, y, pot.height
+        return 0.0, 0.0, self.state.z_height
 
     def _update_area_label(self) -> None:
         if self.area_label is None:
@@ -839,6 +1000,7 @@ class PlotterApp:
             )
         else:
             self.selection_label.text = "No selection"
+        self._update_status_panels()
 
     def _on_workpiece_change(self, e: events.ValueChangeEventArguments) -> None:
         self.state.workpiece = e.value
@@ -885,6 +1047,22 @@ class PlotterApp:
         self._update_canvas()
         self._update_selection_label()
         self._log_status(f"Configured work area preset: {size} ({width:.0f} × {height:.0f} mm).")
+
+    def _reset_all_z_heights(self) -> None:
+        for key in self.state.corner_heights:
+            self.state.corner_heights[key] = 1.0
+        for pot in self.state.pots:
+            pot.height = 1.0
+        self.state.z_height = 1.0
+        if self.z_slider is not None:
+            try:
+                self._suppress_height_event = True
+                self.z_slider.value = 1.0
+            finally:
+                self._suppress_height_event = False
+        self._update_selection_label()
+        self._update_canvas()
+        self._log_status("Reset all Z heights to 1.0")
 
     def _add_pot(self) -> None:
         base_color = "#3a86ff"
@@ -988,6 +1166,7 @@ def _parse_bed_size(value: str) -> Tuple[float, float]:
     return width, height
 
 
+@ui.page("/")
 def main_page() -> None:
     """Instantiate and render the plotter application for the active client."""
     serial_device = APP_CONFIG.get("serial_device")
@@ -1024,6 +1203,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    ui.page("/")(main_page)
-
-    ui.run(title="Pen Plotter Control Suite", show=False)
+    ui.run(title="Pen Plotter Control Suite", show=False, reload=False)
