@@ -642,10 +642,7 @@ class PlotterApp:
         if not self._require_grbl(alert=True):
             return
         await self._set_pen_height(1.0, alert=False)
-        homed = await self._execute_grbl("Homing axes", lambda g: g.cmd("$H"))
-        if homed is not None:
-            self._log_status("Homing sequence complete.")
-        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
+        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True))
         if result is not None:
             self._log_status("Moved to origin (0,0) with pen up.")
 
@@ -1648,6 +1645,8 @@ class PlotterApp:
                 'feed_travel': travel_feed,
                 'lift_delta': lift_delta,
                 'pen_colors': DEFAULT_PEN_COLORS,
+                'default_feed_draw': default_feed,
+                'default_pen_pressure': default_pen_pressure,
             },
             'default_feed': default_feed,
             'default_pen_pressure': default_pen_pressure,
@@ -1670,7 +1669,7 @@ class PlotterApp:
                     pen_pressure = float(cloned.pen_pressure)
                 except (TypeError, ValueError):
                     pen_pressure = -0.1
-                if abs(pen_pressure - (-0.1)) < 1e-6:
+                if abs(pen_pressure + 0.1) < 1e-6:
                     cloned.pen_pressure = float(default_pen_pressure)
             clone.add(cloned)
         return clone
@@ -1686,16 +1685,19 @@ class PlotterApp:
             return
 
         settings = self._collect_run_settings()
-        pattern_clone = self._clone_pattern_for_run(settings['default_feed'], settings['default_pen_pressure'])
-        if settings['default_feed'] is not None and hasattr(self.grbl, 'cfg'):
+        default_feed_draw = settings['default_feed'] if settings['default_feed'] is not None else getattr(self.grbl.cfg, 'feed_draw', None) if hasattr(self.grbl, 'cfg') else None
+        pattern_clone = self._clone_pattern_for_run(default_feed_draw, settings['default_pen_pressure'])
+        if default_feed_draw is not None and hasattr(self.grbl, 'cfg'):
             try:
-                self.grbl.cfg.feed_draw = int(settings['default_feed'])
+                self.grbl.cfg.feed_draw = int(default_feed_draw)
             except Exception:
                 pass
         self._append_comms_log('Starting plot...')
 
         renderer_kwargs = settings['renderer']
         renderer_kwargs['pen_colors'] = getattr(self.grbl, 'pen_colors', DEFAULT_PEN_COLORS)
+        renderer_kwargs['default_feed_draw'] = default_feed_draw
+        renderer_kwargs['default_pen_pressure'] = settings['default_pen_pressure']
         renderer = Renderer(self.grbl, **renderer_kwargs)
         self.renderer = renderer
         self.run_paused = False
@@ -1749,6 +1751,7 @@ class PlotterApp:
             return
         if not self.run_paused:
             self.renderer.request_pause()
+            await self._send_feed_control(b'!', 'Feed hold (pause)')
             self.run_paused = True
             if self.run_pause_button is not None:
                 self.run_pause_button.set_text("Resume")
@@ -1757,6 +1760,7 @@ class PlotterApp:
             self._append_comms_log("Plot paused.")
         else:
             self.renderer.request_resume()
+            await self._send_feed_control(b'~', 'Resume feed')
             self.run_paused = False
             if self.run_pause_button is not None:
                 self.run_pause_button.set_text("Pause")

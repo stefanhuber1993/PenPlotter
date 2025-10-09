@@ -305,7 +305,9 @@ class Renderer:
                  feed_travel: Optional[int] = None,
                  lift_delta: float = 0.2,
                  pen_colors: Optional[dict] = None,
-                 widget_api: Optional[dict] = None):
+                 widget_api: Optional[dict] = None,
+                 default_feed_draw: Optional[int] = None,
+                 default_pen_pressure: float = -0.1):
         self.g = grbl
         self.z_mode = z_mode
         self.z_threshold = float(z_threshold)
@@ -324,6 +326,8 @@ class Renderer:
         self._cancel_requested = False
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self.default_feed_draw = int(default_feed_draw) if default_feed_draw is not None else None
+        self.default_pen_pressure = float(default_pen_pressure)
 
     # ------------------------------ Public API ----------------------------
 
@@ -367,22 +371,10 @@ class Renderer:
 
     def request_pause(self) -> None:
         self._pause_event.clear()
-        try:
-            if getattr(self.g, 'ser', None):
-                self.g.ser.write(b'!')
-                self.g.ser.flush()
-        except Exception:
-            pass
 
     def request_resume(self) -> None:
         if not self._pause_event.is_set():
             self._pause_event.set()
-            try:
-                if getattr(self.g, 'ser', None):
-                    self.g.ser.write(b'~')
-                    self.g.ser.flush()
-            except Exception:
-                pass
 
     def _wait_if_paused(self) -> None:
         self._pause_event.wait()
@@ -492,7 +484,10 @@ class Renderer:
             else:
                 raise TypeError(f"Unsupported item at execution: {type(it).__name__}")
 
-        self._cur_xy = start_xy
+        self._cur_xy = None
+        self._check_cancelled()
+        self._wait_if_paused()
+        self._travel_to(start_xy[0], start_xy[1])
 
         for it in exec_items:
             self._check_cancelled()
@@ -506,6 +501,7 @@ class Renderer:
             if self.settle_up_s > 0:
                 time.sleep(self.settle_up_s)
             self._travel_to(0.0, 0.0)
+            self._pen_set(1.0, settle=False)
             self._cur_xy = (0.0, 0.0)
 
     # ------------------------------ runners ------------------------------
@@ -527,6 +523,13 @@ class Renderer:
                 self.g.cfg.feed_draw = int(it.feed_draw)
             except Exception:
                 pass
+        elif hasattr(self.g, "cfg"):
+            fallback_feed = self.default_feed_draw if self.default_feed_draw is not None else getattr(self.g.cfg, "feed_draw", None)
+            if fallback_feed is not None and fallback_feed > 0:
+                try:
+                    self.g.cfg.feed_draw = int(fallback_feed)
+                except Exception:
+                    pass
 
         # choose z per renderer mode
         if self.z_mode in ("start", "centroid"):
@@ -591,6 +594,8 @@ class Renderer:
 
     def _pen_pos(self, x: float, y: float, pen_pressure: float) -> float:
         # grbl.compensated_pos expects 'pos_offset'; map our pen_pressure to it.
+        if pen_pressure is None:
+            pen_pressure = self.default_pen_pressure
         return self.g.compensated_pos(x, y, pos_offset=pen_pressure)
 
     def _pen_set(self, target: float, *, settle: bool):
