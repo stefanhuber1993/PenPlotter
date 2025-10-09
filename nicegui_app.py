@@ -2296,6 +2296,14 @@ class PlotterApp:
                 transformed = [self._apply_transform(current_transform, x, y) for x, y in points]
                 if len(transformed) >= 2:
                     pattern.add(Polyline(pts=transformed))
+            elif tag == "path":
+                d_attr = element.get("d", "")
+                if d_attr:
+                    subpaths = self._parse_svg_path(d_attr)
+                    for subpath in subpaths:
+                        transformed = [self._apply_transform(current_transform, x, y) for x, y in subpath]
+                        if len(transformed) >= 2:
+                            pattern.add(Polyline(pts=transformed))
             elif tag == "circle":
                 try:
                     cx = float(element.get("cx", "0"))
@@ -2353,6 +2361,240 @@ class PlotterApp:
             for i in range(0, len(values) - 1, 2)
         ]
         return paired
+
+    def _tokenize_svg_path(self, d: str) -> List[Any]:
+        tokens: List[Any] = []
+        number_re = re.compile(r"[-+]?((\d*\.\d+)|(\d+))(?:[eE][-+]?\d+)?")
+        i = 0
+        length = len(d)
+        while i < length:
+            ch = d[i]
+            if ch.isalpha():
+                tokens.append(ch)
+                i += 1
+            elif ch in ", \t\n\r":
+                i += 1
+            else:
+                match = number_re.match(d, i)
+                if match:
+                    tokens.append(float(match.group(0)))
+                    i = match.end()
+                else:
+                    i += 1
+        return tokens
+
+    def _approximate_cubic(self, p0: Tuple[float, float], p1: Tuple[float, float],
+                           p2: Tuple[float, float], p3: Tuple[float, float], segments: int = 12) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for i in range(segments + 1):
+            t = i / segments
+            mt = 1.0 - t
+            x = (mt ** 3) * p0[0] + 3 * (mt ** 2) * t * p1[0] + 3 * mt * (t ** 2) * p2[0] + (t ** 3) * p3[0]
+            y = (mt ** 3) * p0[1] + 3 * (mt ** 2) * t * p1[1] + 3 * mt * (t ** 2) * p2[1] + (t ** 3) * p3[1]
+            points.append((x, y))
+        return points
+
+    def _approximate_quadratic(self, p0: Tuple[float, float], p1: Tuple[float, float],
+                               p2: Tuple[float, float], segments: int = 8) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for i in range(segments + 1):
+            t = i / segments
+            mt = 1.0 - t
+            x = (mt ** 2) * p0[0] + 2 * mt * t * p1[0] + (t ** 2) * p2[0]
+            y = (mt ** 2) * p0[1] + 2 * mt * t * p1[1] + (t ** 2) * p2[1]
+            points.append((x, y))
+        return points
+
+    def _parse_svg_path(self, d: str) -> List[List[Tuple[float, float]]]:
+        tokens = self._tokenize_svg_path(d)
+        if not tokens:
+            return []
+
+        command_params = {
+            'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4, 'Q': 4, 'T': 2, 'A': 7, 'Z': 0
+        }
+
+        subpaths: List[List[Tuple[float, float]]] = []
+        current_path: List[Tuple[float, float]] = []
+        cx = cy = 0.0
+        sx = sy = 0.0
+        cursor = 0
+        current_cmd: Optional[str] = None
+        prev_ctrl_cubic: Optional[Tuple[float, float]] = None
+        prev_ctrl_quad: Optional[Tuple[float, float]] = None
+
+        def add_point(px: float, py: float) -> None:
+            nonlocal current_path
+            if not current_path or abs(current_path[-1][0] - px) > 1e-9 or abs(current_path[-1][1] - py) > 1e-9:
+                current_path.append((px, py))
+
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if isinstance(token, str):
+                current_cmd = token
+                cursor += 1
+                if current_cmd in 'Zz':
+                    if current_path:
+                        add_point(sx, sy)
+                        subpaths.append(current_path)
+                        current_path = []
+                    cx, cy = sx, sy
+                    prev_ctrl_cubic = None
+                    prev_ctrl_quad = None
+                continue
+
+            if current_cmd is None:
+                cursor += 1
+                continue
+
+            cmd = current_cmd
+            upper = cmd.upper()
+            param_count = command_params.get(upper, None)
+            if param_count is None:
+                cursor += 1
+                continue
+
+            if cursor + param_count > len(tokens) or any(isinstance(tokens[cursor + j], str) for j in range(param_count)):
+                current_cmd = None
+                continue
+
+            params = [float(tokens[cursor + j]) for j in range(param_count)]
+            cursor += param_count
+            is_relative = cmd.islower()
+
+            if upper == 'M':
+                if current_path:
+                    subpaths.append(current_path)
+                x, y = params
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                sx, sy = x, y
+                current_path = [(x, y)]
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                current_cmd = 'L' if cmd == 'M' else 'l'
+                continue
+
+            if upper == 'L':
+                x, y = params
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                add_point(x, y)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'H':
+                x = params[0]
+                if is_relative:
+                    x += cx
+                cx = x
+                add_point(cx, cy)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'V':
+                y = params[0]
+                if is_relative:
+                    y += cy
+                cy = y
+                add_point(cx, cy)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'C':
+                x1, y1, x2, y2, x, y = params
+                if is_relative:
+                    x1 += cx
+                    y1 += cy
+                    x2 += cx
+                    y2 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_cubic((cx, cy), (x1, y1), (x2, y2), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_cubic = (x2, y2)
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'S':
+                x2, y2, x, y = params
+                if prev_ctrl_cubic is not None:
+                    x1 = 2 * cx - prev_ctrl_cubic[0]
+                    y1 = 2 * cy - prev_ctrl_cubic[1]
+                else:
+                    x1, y1 = cx, cy
+                if is_relative:
+                    x2 += cx
+                    y2 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_cubic((cx, cy), (x1, y1), (x2, y2), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_cubic = (x2, y2)
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'Q':
+                x1, y1, x, y = params
+                if is_relative:
+                    x1 += cx
+                    y1 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_quadratic((cx, cy), (x1, y1), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_quad = (x1, y1)
+                prev_ctrl_cubic = None
+                continue
+
+            if upper == 'T':
+                x, y = params
+                if prev_ctrl_quad is not None:
+                    x1 = 2 * cx - prev_ctrl_quad[0]
+                    y1 = 2 * cy - prev_ctrl_quad[1]
+                else:
+                    x1, y1 = cx, cy
+                if is_relative:
+                    x += cx
+                    y += cy
+                points = self._approximate_quadratic((cx, cy), (x1, y1), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_quad = (x1, y1)
+                prev_ctrl_cubic = None
+                continue
+
+            if upper == 'A':
+                # Approximate arcs with straight line to the endpoint for simplicity
+                x = params[-2]
+                y = params[-1]
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                add_point(x, y)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+        if current_path:
+            subpaths.append(current_path)
+
+        return subpaths
 
     def _identity_transform(self) -> Tuple[float, float, float, float, float, float]:
         return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
