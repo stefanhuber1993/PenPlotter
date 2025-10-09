@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 
 from nicegui import events, ui
 
-from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS
+from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS, Renderer, RendererCancelled
 from penplot_helper import Config, GRBL
 
 try:
@@ -135,6 +135,12 @@ class PlotterApp:
         self._pending_move_task: Optional[asyncio.Task] = None
         self._pending_pen_value: Optional[float] = None
         self._pending_pen_task: Optional[asyncio.Task] = None
+        self.renderer: Optional[Renderer] = None
+        self.run_task: Optional[asyncio.Task] = None
+        self.run_paused: bool = False
+        self.run_start_button = None
+        self.run_pause_button = None
+        self.run_stop_button = None
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -633,11 +639,12 @@ class PlotterApp:
         self._log_status(f"Pen moved to {target:.2f} height.")
 
     async def _home_axes(self) -> None:
-        result = await self._execute_grbl("Homing axes", lambda g: g.cmd("$H"))
+        if not self._require_grbl(alert=True):
+            return
+        await self._set_pen_height(1.0, alert=False)
+        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True))
         if result is not None:
-            self._log_status("Homing command sent.")
-            await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
-            await self._set_pen_height(1.0, alert=False)
+            self._log_status("Moved to origin (0,0) with pen up.")
 
     async def _sweep_work_area(self) -> None:
         min_x, min_y = self.state.rect_min
@@ -1361,11 +1368,11 @@ class PlotterApp:
                 max_value: Optional[float] = None,
                 step: Optional[float] = None,
                 hint: Optional[str] = None,
-            ) -> None:
+            ) -> ui.number:
                 with ui.column().classes("gap-1"):
                     with ui.row().classes("items-center justify-between gap-2"):
                         ui.label(label).classes("text-[10px] text-gray-500")
-                        ui.number(
+                        number = ui.number(
                             value=value,
                             min=min_value,
                             max=max_value,
@@ -1373,15 +1380,16 @@ class PlotterApp:
                         ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
                     if hint:
                         ui.label(hint).classes("text-[10px] text-gray-400 leading-tight")
+                return number
 
             with ui.column().classes("gap-3"):
                 with ui.column().classes("gap-2"):
                     ui.label("Mode").classes("text-[11px] font-medium text-gray-600")
-                    ui.toggle(
+                    self.cfg_z_mode_toggle = ui.toggle(
                         options=["start", "centroid", "per_segment", "threshold"],
                         value="per_segment",
                     ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
-                    number_field(
+                    self.cfg_z_threshold = number_field(
                         "Z threshold",
                         value=0.02,
                         min_value=0.0,
@@ -1392,32 +1400,32 @@ class PlotterApp:
 
                 with ui.column().classes("gap-2"):
                     ui.label("Pen Motion").classes("text-[11px] font-medium text-gray-600")
-                    number_field("Lift delta (mm)", value=0.2, min_value=0.0, max_value=1.0, step=0.01)
-                    number_field("Settle down (s)", value=0.05, min_value=0.0, max_value=5.0, step=0.01)
-                    number_field("Settle up (s)", value=0.03, min_value=0.0, max_value=5.0, step=0.01)
-                    number_field("Z step (mm)", value=0.1, min_value=0.0, max_value=1.0, step=0.01)
-                    number_field("Z step delay (s)", value=0.03, min_value=0.0, max_value=1.0, step=0.005)
+                    self.cfg_lift_delta = number_field("Lift delta", value=0.4, min_value=0.0, max_value=1.0, step=0.01)
+                    self.cfg_settle_down = number_field("Settle down (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
+                    self.cfg_settle_up = number_field("Settle up (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
+                    self.cfg_z_step = number_field("Z step", value=0.05, min_value=0.0, max_value=1.0, step=0.01)
+                    self.cfg_z_step_delay = number_field("Z step delay (s)", value=0.00, min_value=0.0, max_value=1.0, step=0.005)
 
                 with ui.column().classes("gap-2"):
                     ui.label("Optimization").classes("text-[11px] font-medium text-gray-600")
-                    ui.checkbox("Nearest-neighbour optimization", value=False).classes("text-[11px]")
+                    self.cfg_nn_checkbox = ui.checkbox("Nearest-neighbour optimization", value=False).classes("text-[11px]")
                     with ui.column().classes("gap-1 pl-2"):
-                        number_field(
+                        self.cfg_start_x = number_field(
                             "Start X (mm)",
                             value=0.0,
                             min_value=0.0,
                             step=0.1,
                             hint="Only applied when NN optimization is enabled.",
                         )
-                        number_field(
+                        self.cfg_start_y = number_field(
                             "Start Y (mm)",
                             value=0.0,
                             min_value=0.0,
                             step=0.1,
                         )
                     with ui.row().classes("items-start justify-between gap-2"):
-                        ui.checkbox("Combine endpoints", value=True).classes("text-[11px]")
-                        ui.number(
+                        self.cfg_combine_checkbox = ui.checkbox("Combine endpoints", value=False).classes("text-[11px]")
+                        self.cfg_join_tol = ui.number(
                             label="Join tol (mm)",
                             value=0.05,
                             min=0.0,
@@ -1425,37 +1433,58 @@ class PlotterApp:
                         ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
                     with ui.column().classes("gap-1"):
                         with ui.row().classes("items-center justify-between gap-2"):
-                            ui.checkbox("Resample paths", value=True).classes("text-[11px]")
-                            ui.number(
+                            self.cfg_resample_checkbox = ui.checkbox("Resample paths", value=True).classes("text-[11px]")
+                            self.cfg_max_dev = ui.number(
                                 label="Max dev (mm)",
                                 value=0.1,
                                 min=0.0,
                                 step=0.01,
                             ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                        self.cfg_max_seg = ui.number(
+                            label="Max seg (mm)",
+                            value=0.0,
+                            min=0.0,
+                            step=0.1,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
 
                 with ui.column().classes("gap-2"):
                     ui.label("Miscellaneous").classes("text-[11px] font-medium text-gray-600")
-                    number_field("Flush every (cmds)", value=200.0, min_value=1.0, step=10.0)
-                    number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
+                    self.cfg_flush_every = number_field("Flush every (cmds)", value=200.0, min_value=1.0, step=10.0)
+                    self.cfg_travel_feed = number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
+                    self.cfg_default_feed_draw = number_field("Default draw feed (mm/min)", value=4000.0, min_value=1.0, step=100.0)
 
     def _build_run_tab(self) -> None:
         with ui.card().classes("p-2 gap-3"):
             ui.label("Preview & Run").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
             self.pen_filter_select = ui.select(
-                options=[],
-                value=None,
+                options=["All pens"],
+                value="All pens",
                 with_input=False,
                 on_change=self._on_pen_filter_changed,
-            ).props("label='Pen' dense emit-value map-options option-label='label' option-value='value'").classes("w-full text-[11px]")
+            ).props("label='Pen' dense").classes("w-full text-[11px]")
 
             with ui.row().classes("gap-2"):
-                ui.button("Start", color="positive", on_click=lambda: self._notify("Run started."))
-                ui.button("Pause", on_click=lambda: self._notify("Run paused/resumed."))
-                ui.button("Stop", color="negative", on_click=lambda: self._notify("Run stopped."))
+                self.run_start_button = ui.button(
+                    "Start",
+                    color="positive",
+                    on_click=lambda: self._spawn(self._start_plot()),
+                )
+                self.run_pause_button = ui.button(
+                    "Pause",
+                    on_click=lambda: self._spawn(self._toggle_pause_plot()),
+                )
+                self.run_stop_button = ui.button(
+                    "Stop",
+                    color="negative",
+                    on_click=lambda: self._spawn(self._stop_plot()),
+                )
+                self.run_pause_button.disable()
+                self.run_stop_button.disable()
 
             self.progress = ui.linear_progress(value=0.0).props("color=primary")
             self.progress_label = ui.label("Idle").classes("text-[11px]")
             self._update_pen_filter_options()
+            self._update_run_buttons()
 
     def _pen_ids_in_pattern(self) -> List[int]:
         pen_ids: set[int] = set()
@@ -1469,26 +1498,276 @@ class PlotterApp:
                 continue
         return sorted(pen_ids)
 
-    def _pen_filter_options(self) -> List[Dict[str, Any]]:
-        options: List[Dict[str, Any]] = [{"label": "All pens", "value": "all"}]
+    def _pen_filter_options(self) -> List[str]:
+        options: List[str] = ["All pens"]
         for pen_id in self._pen_ids_in_pattern():
-            options.append({"label": f"Pen {pen_id}", "value": str(pen_id)})
+            options.append(f"Pen {pen_id}")
         return options
 
     def _update_pen_filter_options(self) -> None:
         options = self._pen_filter_options()
-        valid_values = {str(opt["value"]) for opt in options}
+        valid_values = {"all"}
+        valid_values.update({str(pid) for pid in self._pen_ids_in_pattern()})
         if str(self.preview_pen_choice) not in valid_values:
             self.preview_pen_choice = "all"
         if self.pen_filter_select is not None:
             self.pen_filter_select.options = options
-            self.pen_filter_select.value = self.preview_pen_choice
+            self.pen_filter_select.value = self._label_for_pen_choice(self.preview_pen_choice)
             self.pen_filter_select.update()
 
     def _on_pen_filter_changed(self, event: events.ValueChangeEventArguments) -> None:
-        value = event.value or "all"
-        self.preview_pen_choice = str(value)
+        label = (event.value or "All pens").strip()
+        self.preview_pen_choice = self._value_from_pen_label(label)
         self._update_canvas()
+
+    def _float_value(self, control: Any, default: float) -> float:
+        try:
+            value = control.value
+        except AttributeError:
+            return default
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int_value(self, control: Any, default: Optional[int]) -> Optional[int]:
+        val = self._float_value(control, default if default is not None else 0)
+        if val is None:
+            return default
+        if val <= 0 and default is None:
+            return None
+        return int(round(val))
+
+    async def _send_feed_control(self, command: bytes, description: str) -> None:
+        if not self._is_grbl_ready():
+            return
+        ser = getattr(self.grbl, "ser", None)
+        if ser is None:
+            return
+        try:
+            ser.write(command)
+            ser.flush()
+            self._append_comms_log(description)
+        except Exception as exc:
+            self._append_comms_log(f"[error] {description} failed: {exc}")
+
+    def _label_for_pen_choice(self, choice: str) -> str:
+        return "All pens" if choice in (None, "", "all") else f"Pen {choice}"
+
+    def _value_from_pen_label(self, label: str) -> str:
+        label = label.strip()
+        if label.lower().startswith("all"):
+            return "all"
+        if label.lower().startswith("pen"):
+            parts = label.split()
+            if len(parts) >= 2:
+                try:
+                    return str(int(parts[1]))
+                except ValueError:
+                    pass
+        return "all"
+
+    def _collect_run_settings(self) -> Dict[str, Any]:
+        z_mode = self.cfg_z_mode_toggle.value if self.cfg_z_mode_toggle else "per_segment"
+        z_threshold = self._float_value(self.cfg_z_threshold, 0.02)
+        settle_down = self._float_value(self.cfg_settle_down, 0.05)
+        settle_up = self._float_value(self.cfg_settle_up, 0.03)
+        z_step = self._float_value(self.cfg_z_step, 0.0)
+        if z_step <= 0:
+            z_step = None
+        z_step_delay = self._float_value(self.cfg_z_step_delay, 0.03)
+        flush_every = max(1, self._int_value(self.cfg_flush_every, 200) or 200)
+        travel_feed = self._int_value(self.cfg_travel_feed, None)
+        lift_delta = self._float_value(self.cfg_lift_delta, 0.2)
+        default_feed = self._int_value(self.cfg_default_feed_draw, None)
+
+        start_x = self._float_value(self.cfg_start_x, 0.0)
+        start_y = self._float_value(self.cfg_start_y, 0.0)
+        optimize = 'nn' if self.cfg_nn_checkbox and self.cfg_nn_checkbox.value else None
+
+        combine = None
+        if self.cfg_combine_checkbox and self.cfg_combine_checkbox.value:
+            combine = {'join_tol_mm': self._float_value(self.cfg_join_tol, 0.05)}
+
+        resample = None
+        if self.cfg_resample_checkbox and self.cfg_resample_checkbox.value:
+            resample = {
+                'max_dev_mm': self._float_value(self.cfg_max_dev, 0.1),
+                'max_seg_mm': None,
+            }
+            max_seg_val = self._float_value(self.cfg_max_seg, 0.0)
+            if max_seg_val > 0:
+                resample['max_seg_mm'] = max_seg_val
+
+        pen_filter = None
+        if self.preview_pen_choice not in (None, "", "all"):
+            try:
+                pen_filter = int(self.preview_pen_choice)
+            except ValueError:
+                pen_filter = None
+
+        return {
+            'renderer': {
+                'z_mode': z_mode,
+                'z_threshold': z_threshold,
+                'settle_down_s': settle_down,
+                'settle_up_s': settle_up,
+                'z_step': z_step,
+                'z_step_delay': z_step_delay,
+                'flush_every': flush_every,
+                'feed_travel': travel_feed,
+                'lift_delta': lift_delta,
+                'pen_colors': DEFAULT_PEN_COLORS,
+            },
+            'default_feed': default_feed,
+            'start_xy': (start_x, start_y),
+            'optimize': optimize,
+            'resample': resample,
+            'combine': combine,
+            'pen_filter': pen_filter,
+            'return_home': True,
+        }
+
+    def _clone_pattern_for_run(self, default_feed: Optional[int]) -> Pattern:
+        clone = Pattern()
+        for item in self.pattern.items:
+            cloned = self._clone_pattern_item(item)
+            if isinstance(cloned, Polyline) and (cloned.feed_draw is None or cloned.feed_draw <= 0):
+                if default_feed is not None:
+                    cloned.feed_draw = int(default_feed)
+            clone.add(cloned)
+        return clone
+
+    async def _start_plot(self) -> None:
+        if self.run_task and not self.run_task.done():
+            ui.notify("A plot is already running.", color="warning")
+            return
+        if not self.pattern.items:
+            ui.notify("Load a pattern before starting.", color="warning")
+            return
+        if not self._require_grbl(alert=True):
+            return
+
+        settings = self._collect_run_settings()
+        pattern_clone = self._clone_pattern_for_run(settings['default_feed'])
+        if settings['default_feed'] is not None and hasattr(self.grbl, 'cfg'):
+            try:
+                self.grbl.cfg.feed_draw = int(settings['default_feed'])
+            except Exception:
+                pass
+        self._append_comms_log('Starting plot...')
+
+        renderer_kwargs = settings['renderer']
+        renderer_kwargs['pen_colors'] = getattr(self.grbl, 'pen_colors', DEFAULT_PEN_COLORS)
+        renderer = Renderer(self.grbl, **renderer_kwargs)
+        self.renderer = renderer
+        self.run_paused = False
+        if self.progress_label is not None:
+            self.progress_label.set_text("Running...")
+        self._update_run_buttons()
+
+        async def runner() -> None:
+            try:
+                await asyncio.to_thread(
+                    renderer.run,
+                    pattern_clone,
+                    start_xy=settings['start_xy'],
+                    optimize=settings['optimize'],
+                    resample=settings['resample'],
+                    combine=settings['combine'],
+                    return_home=settings['return_home'],
+                    pen_filter=settings['pen_filter'],
+                    preview_in_widget=False,
+                )
+            except RendererCancelled:
+                self._append_comms_log("Plot cancelled.")
+                try:
+                    ui.notify("Plot cancelled.", color="warning")
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                self._append_comms_log(f"[error] Plot failed: {exc}")
+                try:
+                    ui.notify(f"Plot failed: {exc}", color="negative")
+                except RuntimeError:
+                    pass
+            else:
+                self._append_comms_log("Plot completed.")
+            finally:
+                self.renderer = None
+                self.run_paused = False
+                self.run_task = None
+                if self.progress_label is not None:
+                    self.progress_label.set_text("Idle")
+                self._update_run_buttons()
+
+        self.run_task = asyncio.create_task(runner())
+        self._update_run_buttons()
+
+    async def _toggle_pause_plot(self) -> None:
+        if not self.run_task or self.run_task.done():
+            ui.notify("No active plot to pause.", color="warning")
+            return
+        if not self.renderer:
+            return
+        if not self.run_paused:
+            self.renderer.request_pause()
+            self.run_paused = True
+            if self.run_pause_button is not None:
+                self.run_pause_button.set_text("Resume")
+            if self.progress_label is not None:
+                self.progress_label.set_text("Paused")
+            self._append_comms_log("Plot paused.")
+        else:
+            self.renderer.request_resume()
+            self.run_paused = False
+            if self.run_pause_button is not None:
+                self.run_pause_button.set_text("Pause")
+            if self.progress_label is not None:
+                self.progress_label.set_text("Running...")
+            self._append_comms_log("Plot resumed.")
+        self._update_run_buttons()
+
+    async def _stop_plot(self) -> None:
+        if not self.run_task or self.run_task.done():
+            ui.notify("No active plot to stop.", color="warning")
+            return
+        if self.renderer:
+            self.renderer.request_cancel()
+            await self._send_feed_control(b'~', 'Released feed hold')
+        self._append_comms_log("Stop requested.")
+        try:
+            await self.run_task
+        finally:
+            self.run_task = None
+            self.renderer = None
+            self.run_paused = False
+            await self._send_feed_control(b'~', 'Ensured feed hold released')
+            if self.progress_label is not None:
+                self.progress_label.set_text("Cancelled")
+            self._update_run_buttons()
+
+    def _update_run_buttons(self) -> None:
+        running = bool(self.run_task and not self.run_task.done())
+        if self.run_start_button is not None:
+            if running:
+                self.run_start_button.disable()
+            else:
+                self.run_start_button.enable()
+        if self.run_pause_button is not None:
+            if running:
+                self.run_pause_button.enable()
+                self.run_pause_button.set_text("Resume" if self.run_paused else "Pause")
+            else:
+                self.run_pause_button.disable()
+                self.run_pause_button.set_text("Pause")
+        if self.run_stop_button is not None:
+            if running:
+                self.run_stop_button.enable()
+            else:
+                self.run_stop_button.disable()
 
     def _preview_selected_pen(self) -> None:
         if not self.pattern.items:

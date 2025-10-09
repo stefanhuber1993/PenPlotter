@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Union, Iterable
-import math, time
+import math, time, threading
 
 XY = Tuple[float, float]
 
@@ -280,6 +280,11 @@ DEFAULT_PEN_COLORS = {
     8: "#999999",
 }
 
+
+class RendererCancelled(Exception):
+    """Raised when a renderer run is cancelled."""
+
+
 class Renderer:
     """
     Executes a Pattern on a GRBL-like device and can preview into the PPW widget.
@@ -316,6 +321,9 @@ class Renderer:
         if pen_colors:
             self.pen_colors.update(pen_colors)
         self.widget_api = widget_api  # optional explicit attach
+        self._cancel_requested = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()
 
     # ------------------------------ Public API ----------------------------
 
@@ -342,6 +350,46 @@ class Renderer:
         except Exception:
             pass
         return None
+
+    def reset_control(self) -> None:
+        self._cancel_requested = False
+        self._pause_event.set()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        self._pause_event.set()
+        try:
+            if getattr(self.g, 'ser', None):
+                self.g.ser.write(b'!')
+                self.g.ser.flush()
+        except Exception:
+            pass
+
+    def request_pause(self) -> None:
+        self._pause_event.clear()
+        try:
+            if getattr(self.g, 'ser', None):
+                self.g.ser.write(b'!')
+                self.g.ser.flush()
+        except Exception:
+            pass
+
+    def request_resume(self) -> None:
+        if not self._pause_event.is_set():
+            self._pause_event.set()
+            try:
+                if getattr(self.g, 'ser', None):
+                    self.g.ser.write(b'~')
+                    self.g.ser.flush()
+            except Exception:
+                pass
+
+    def _wait_if_paused(self) -> None:
+        self._pause_event.wait()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested:
+            raise RendererCancelled()
 
     def plot(self, pattern: Pattern, *, pens: Optional[Union[int, Iterable[int]]] = None,
              width: float = 1.5) -> None:
@@ -410,6 +458,8 @@ class Renderer:
         preview_in_widget: if True, send a preview to the widget before executing.
         """
 
+        self.reset_control()
+
         if combine is not None:
             msg = pattern.combine_endpoints(join_tol_mm=combine.get('join_tol_mm', 0.05))
             print(msg)
@@ -445,14 +495,17 @@ class Renderer:
         self._cur_xy = start_xy
 
         for it in exec_items:
+            self._check_cancelled()
+            self._wait_if_paused()
             self._run_polyline(it)
 
         if return_home:
-            self.g.pen_set(1.0, step=self.z_step, step_delay_s=self.z_step_delay, wait=False)
+            self._check_cancelled()
+            self._wait_if_paused()
+            self._pen_set(1.0, settle=False)
             if self.settle_up_s > 0:
                 time.sleep(self.settle_up_s)
-            feed = self.feed_travel if self.feed_travel is not None else getattr(self.g.cfg, "feed_travel", None)
-            self.g.move_xy(0.0, 0.0, feed=feed, wait=True)
+            self._travel_to(0.0, 0.0)
             self._cur_xy = (0.0, 0.0)
 
     # ------------------------------ runners ------------------------------
@@ -464,6 +517,8 @@ class Renderer:
 
         # travel to start at feed_travel
         x0, y0 = pts[0]
+        self._check_cancelled()
+        self._wait_if_paused()
         self._travel_to(x0, y0)
 
         # per-shape draw feed
@@ -483,6 +538,8 @@ class Renderer:
             z = self._pen_pos(zx, zy, it.pen_pressure)
             self._pen_set(z, settle=True)
             for i in range(1, len(pts)):
+                self._check_cancelled()
+                self._wait_if_paused()
                 ex, ey = pts[i]
                 self.g.draw_xy(ex, ey, wait=False)
                 if i % self.flush_every == 0:
@@ -498,6 +555,8 @@ class Renderer:
                 sx, sy = pts[i - 1]; ex, ey = pts[i]
                 mx, my = 0.5*(sx+ex), 0.5*(sy+ey)
                 z = self._pen_pos(mx, my, it.pen_pressure)
+                self._check_cancelled()
+                self._wait_if_paused()
                 self._pen_set(z, settle=False)
                 self.g.draw_xy(ex, ey, wait=False)
                 if i % self.flush_every == 0:
@@ -513,6 +572,8 @@ class Renderer:
                 sx, sy = pts[i - 1]; ex, ey = pts[i]
                 mx, my = 0.5*(sx+ex), 0.5*(sy+ey)
                 z = self._pen_pos(mx, my, it.pen_pressure)
+                self._check_cancelled()
+                self._wait_if_paused()
                 if abs(z - cur_z) > self.z_threshold:
                     self._pen_set(z, settle=False)
                     cur_z = z
@@ -533,6 +594,8 @@ class Renderer:
         return self.g.compensated_pos(x, y, pos_offset=pen_pressure)
 
     def _pen_set(self, target: float, *, settle: bool):
+        self._check_cancelled()
+        self._wait_if_paused()
         self.g.pen_set(target, step=self.z_step, step_delay_s=self.z_step_delay, wait=False)
         if settle and self.settle_down_s > 0:
             time.sleep(self.settle_down_s)
@@ -541,11 +604,15 @@ class Renderer:
         x, y = xy
         base = self._pen_pos(x, y, 0.0)
         target = min(1.0, base + self.lift_delta)
+        self._check_cancelled()
+        self._wait_if_paused()
         self.g.pen_set(target, step=self.z_step, step_delay_s=self.z_step_delay, wait=False)
         if self.settle_up_s > 0:
             time.sleep(self.settle_up_s)
 
     def _travel_to(self, x: float, y: float):
+        self._check_cancelled()
+        self._wait_if_paused()
         feed = self.feed_travel if self.feed_travel is not None else getattr(self.g.cfg, "feed_travel", None)
         if self._cur_xy is not None:
             self._partial_lift_to_travel(self._cur_xy)
