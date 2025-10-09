@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import os
 import math
+import asyncio
 from pathlib import Path
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -22,6 +24,12 @@ import xml.etree.ElementTree as ET
 from nicegui import events, ui
 
 from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS
+from penplot_helper import Config, GRBL
+
+try:
+    from serial.tools import list_ports
+except Exception:  # pragma: no cover - optional dependency safeguard
+    list_ports = None  # type: ignore
 
 
 DEFAULT_BED_SIZE: Tuple[float, float] = (300.0, 245.0)
@@ -43,7 +51,6 @@ class Pot:
 class PlotterState:
     """Aggregates all mutable UI state for the mock implementation."""
 
-    workpiece: str = "A4"
     z_height: float = 1.0
     status_lines: List[str] = field(default_factory=lambda: ["Ready. Configure the plotter to begin."])
     pots: List[Pot] = field(default_factory=list)
@@ -83,7 +90,6 @@ class PlotterApp:
         self.pot_select = None
         self.progress = None
         self.progress_label = None
-        self.workpiece_select = None
         self.color_picker = None
         self.canvas = None
         self.canvas_element = None
@@ -109,6 +115,21 @@ class PlotterApp:
         self.pattern_summary_label = None
         self.pattern_script_area = None
         self.pattern_has_data = False
+        self.pen_filter_select = None
+        self.preview_pen_choice: str = "all"
+        self.serial_select = None
+        self.connect_button = None
+        self.disconnect_button = None
+        self.comms_status_label = None
+        self.comms_output = None
+        self.gcode_input = None
+        self.comms_log_lines: List[str] = []
+        self.grbl: Optional[GRBL] = None
+        self.grbl_config = Config()
+        if serial_device:
+            self.grbl_config.port = serial_device
+        self._is_connecting = False
+        self.serial_port_map: Dict[str, str] = {}
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -228,11 +249,6 @@ class PlotterApp:
                     ui.label(f"Device: {self.state.serial_device}").classes(
                         "text-xs font-medium px-2 py-0.5 bg-white text-primary rounded"
                     )
-            self.workpiece_select = ui.select(
-                ["A4", "A5", "15 cm", "10 cm"],
-                value=self.state.workpiece,
-                on_change=self._on_workpiece_change,
-            ).props("label='Workpiece' dense")
 
         with ui.column().classes("w-full mx-auto p-3 gap-3"):
             with ui.row().classes("w-full gap-3 items-stretch").style(
@@ -306,7 +322,7 @@ class PlotterApp:
                 tab_area = ui.tab("Area").classes("px-2 py-1 text-[10px]")
                 tab_load = ui.tab("Load").classes("px-2 py-1 text-[10px]")
                 tab_pots = ui.tab("Pots").classes("px-2 py-1 text-[10px]")
-                tab_console = ui.tab("Console").classes("px-2 py-1 text-[10px]")
+                tab_comms = ui.tab("Comms").classes("px-2 py-1 text-[10px]")
                 tab_config = ui.tab("Config").classes("px-2 py-1 text-[10px]")
                 tab_run = ui.tab("Run").classes("px-2 py-1 text-[10px]")
             with ui.tab_panels(tabs, value=tab_area).classes("h-full text-[11px]"):
@@ -316,8 +332,8 @@ class PlotterApp:
                     self._build_load_tab()
                 with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-2"):
                     self._build_pot_controls()
-                with ui.tab_panel(tab_console).classes("h-full overflow-y-auto p-2"):
-                    self._build_console_tab()
+                with ui.tab_panel(tab_comms).classes("h-full overflow-y-auto p-2"):
+                    self._build_comms_tab()
                 with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-2"):
                     self._build_config_tab()
                 with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-2"):
@@ -332,6 +348,10 @@ class PlotterApp:
                     self._compact_button("A5", lambda: self._quick_size("A5"))
                     self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
                     self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Work Area Utilities").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                with ui.row().classes("gap-2 flex-wrap text-[11px]"):
+                    self._compact_button("Sweep Area", lambda: self._notify("Swept work area."))
                     self._compact_button("Reset Z Heights", self._reset_all_z_heights)
             with ui.card().classes("p-2 gap-3 items-center"):
                 ui.label("Z Height").classes("text-[10px] uppercase tracking-wide text-gray-500")
@@ -345,17 +365,256 @@ class PlotterApp:
                         on_change=self._on_height_change,
                     ).props("vertical reverse label-always").style("height:240px;width:2.2rem;")
 
-    def _build_console_tab(self) -> None:
-        with ui.card().classes("p-2 gap-2"):
-            ui.label("G-code Console").classes("text-[12px] font-medium")
-            console_input = ui.textarea(placeholder="Enter G-code commands...").props("autogrow")
-            with ui.row().classes("gap-2"):
-                ui.button(
-                    "Send",
-                    on_click=lambda: self._log_status(f"Sent G-code: {console_input.value.strip()}"),
-                    color="primary",
+    def _build_comms_tab(self) -> None:
+        with ui.card().classes("p-3 gap-3 w-full"):
+            ui.label("Serial Link").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
+            with ui.row().classes("gap-2 items-center flex-wrap"):
+                self.serial_select = ui.select(
+                    options=[],
+                    value=None,
+                    with_input=False,
+                ).props("label='Serial device' dense").classes("min-w-[220px] text-[11px]")
+                ui.button("Refresh", on_click=self._refresh_serial_ports).props("size='sm' outline").classes(
+                    "text-[11px]"
+                )
+            with ui.row().classes("gap-2 flex-wrap"):
+                self.connect_button = ui.button(
+                    "Connect",
+                    color="positive",
+                    on_click=self._connect_to_plotter,
                 ).props("unelevated size='sm'")
-                ui.button("Clear", on_click=lambda: console_input.set_value("")).props("unelevated size='sm'")
+                self.disconnect_button = ui.button(
+                    "Disconnect",
+                    color="negative",
+                    on_click=self._disconnect_plotter,
+                ).props("outline size='sm'")
+            self.comms_status_label = ui.label("Disconnected").classes(
+                "text-[11px] font-mono text-gray-400"
+            )
+
+            ui.separator()
+            ui.label("Terminal").classes("text-[11px] font-medium text-gray-600")
+            self.comms_output = ui.code("", language="text").classes(
+                "w-full max-w-[360px] mx-auto bg-gray-900 text-green-300 text-[11px] font-mono rounded-lg p-3 "
+                "shadow-inner min-h-[200px] max-h-[260px] overflow-y-auto overflow-x-auto"
+            ).style("width: 100%; box-sizing: border-box; white-space: pre-wrap; word-break: break-word;")
+
+            ui.separator()
+            ui.label("Send G-code").classes("text-[11px] font-medium text-gray-600")
+            self.gcode_input = ui.textarea(
+                placeholder="Enter G-code commands..."
+            ).props("autogrow rows=3 dense").classes("font-mono text-[12px]")
+            with ui.row().classes("gap-2 justify-end"):
+                ui.button("Send", color="primary", on_click=self._send_gcode_command).props("unelevated size='sm'")
+                ui.button("Clear Log", on_click=self._clear_comms_log).props("size='sm'")
+
+        self._refresh_serial_ports()
+        self._update_comms_log_display()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    def _refresh_serial_ports(self) -> None:
+        if self.serial_select is None:
+            return
+        ports: List[Any] = []
+        if list_ports is not None:
+            try:
+                ports = list(list_ports.comports())
+            except Exception as exc:  # pragma: no cover
+                self._append_comms_log(f"[error] Unable to enumerate serial ports: {exc}")
+        self.serial_port_map = {}
+        label_by_device: Dict[str, str] = {}
+        option_labels: List[str] = []
+        for port in ports:
+            device = getattr(port, "device", None) or getattr(port, "name", "")
+            description = getattr(port, "description", "") or ""
+            label = device
+            if description and description != device:
+                label = f"{device} — {description}"
+            label = str(label)
+            device_value = str(device)
+            self.serial_port_map[label] = device_value
+            label_by_device[device_value] = label
+            option_labels.append(label)
+        previous_label = self.serial_select.value
+        previous_device = self.serial_port_map.get(previous_label, previous_label) if previous_label else None
+        self.serial_select.options = option_labels
+        preferred = None
+        if self.grbl and self.grbl.ser and getattr(self.grbl.ser, "port", None):
+            preferred = self.grbl.ser.port
+        elif getattr(self.grbl_config, "port", None):
+            preferred = self.grbl_config.port
+        new_device = None
+        if option_labels:
+            valid_devices = set(label_by_device.keys())
+            if preferred in valid_devices:
+                new_device = preferred
+            elif previous_device in valid_devices:
+                new_device = previous_device
+            else:
+                new_device = next(iter(valid_devices))
+        if new_device:
+            display_label = label_by_device.get(new_device)
+        else:
+            display_label = None
+        self.serial_select.value = display_label
+        self.serial_select.update()
+        self._update_comms_buttons()
+        self._schedule_comms_scroll()
+
+    def _update_comms_status(self, *, message: Optional[str] = None) -> None:
+        if self.comms_status_label is None:
+            return
+        if message is not None:
+            self.comms_status_label.set_text(message)
+            return
+        if self._is_connecting:
+            status_text = "Connecting..."
+        elif self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False):
+            status_text = f"Connected to {self.grbl.cfg.port} @ {self.grbl.cfg.baudrate}"
+        else:
+            status_text = "Disconnected"
+        self.comms_status_label.set_text(status_text)
+
+    def _update_comms_buttons(self) -> None:
+        connected = bool(self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False))
+        if self.connect_button is not None:
+            if connected or self._is_connecting:
+                self.connect_button.disable()
+            else:
+                self.connect_button.enable()
+        if self.disconnect_button is not None:
+            if connected and not self._is_connecting:
+                self.disconnect_button.enable()
+            else:
+                self.disconnect_button.disable()
+
+    def _update_comms_log_display(self) -> None:
+        if self.comms_output is None:
+            return
+        content = "\n".join(self.comms_log_lines)
+        self.comms_output.set_content(content)
+        self._schedule_comms_scroll()
+
+    def _schedule_comms_scroll(self) -> None:
+        if self.comms_output is None:
+            return
+
+        async def _scroll() -> None:
+            await asyncio.sleep(0.05)
+            element_id = self.comms_output.id
+            script = (
+                f"""
+                (function() {{
+                    const wrap = document.getElementById('{element_id}');
+                    if (!wrap) return;
+                    wrap.scrollTop = wrap.scrollHeight;
+                }})();
+                """
+            )
+            try:
+                await ui.run_javascript(script)
+            except Exception:
+                pass
+
+        asyncio.create_task(_scroll())
+
+    def _append_comms_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.comms_log_lines.append(f"[{timestamp}] {message}")
+        if len(self.comms_log_lines) > 400:
+            self.comms_log_lines = self.comms_log_lines[-400:]
+        self._update_comms_log_display()
+
+    def _clear_comms_log(self) -> None:
+        self.comms_log_lines.clear()
+        self._update_comms_log_display()
+        self._append_comms_log("Log cleared.")
+
+    def _connect_grbl_sync(self, port: str) -> GRBL:
+        cfg_data = vars(self.grbl_config).copy()
+        cfg_data["port"] = port
+        cfg = Config(**cfg_data)
+        grbl = GRBL(cfg).connect()
+        return grbl
+
+    async def _connect_to_plotter(self) -> None:
+        if self._is_connecting:
+            return
+        if self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False):
+            ui.notify("Plotter is already connected.", color="info")
+            return
+        port_label = self.serial_select.value if self.serial_select else None
+        port = self.serial_port_map.get(port_label, port_label)
+        if not port:
+            ui.notify("Select a serial device first.", color="warning")
+            return
+        self._is_connecting = True
+        self._update_comms_buttons()
+        self._update_comms_status(message=f"Connecting to {port} ...")
+        self._append_comms_log(f"Connecting to {port} ...")
+        try:
+            grbl = await asyncio.to_thread(self._connect_grbl_sync, port)
+        except Exception as exc:
+            self._is_connecting = False
+            error_text = f"Failed to connect: {exc}"
+            self._append_comms_log(f"[error] {error_text}")
+            self._update_comms_status(message="Connection failed.")
+            self._update_comms_buttons()
+            ui.notify(error_text, color="negative")
+            return
+        self.grbl = grbl
+        self.grbl_config = grbl.cfg
+        self._is_connecting = False
+        success_text = f"Connected to {grbl.cfg.port} @ {grbl.cfg.baudrate}"
+        self._append_comms_log(success_text)
+        ui.notify(f"Connected to {grbl.cfg.port}", color="positive")
+        self._refresh_serial_ports()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    async def _disconnect_plotter(self, *, silent: bool = False) -> None:
+        if not self.grbl:
+            if not silent:
+                ui.notify("No active connection.", color="warning")
+            return
+        grbl = self.grbl
+        self.grbl = None
+        await asyncio.to_thread(grbl.close)
+        message = f"Disconnected from {grbl.cfg.port}"
+        self._append_comms_log(message)
+        if not silent:
+            ui.notify(message, color="info")
+        self._refresh_serial_ports()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    async def _send_gcode_command(self) -> None:
+        if not (self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False)):
+            ui.notify("Connect to the plotter before sending commands.", color="warning")
+            return
+        if self.gcode_input is None:
+            return
+        raw_text = self.gcode_input.value or ""
+        commands = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if not commands:
+            ui.notify("Enter at least one G-code command.", color="warning")
+            return
+        for command in commands:
+            self._append_comms_log(f"> {command}")
+            try:
+                responses = await asyncio.to_thread(self.grbl.cmd, command)
+            except Exception as exc:
+                error_text = f"G-code error: {exc}"
+                self._append_comms_log(f"[error] {error_text}")
+                ui.notify(error_text, color="negative")
+                break
+            else:
+                for line in responses:
+                    self._append_comms_log(line)
+        self._update_comms_status()
+        if self.gcode_input is not None:
+            self.gcode_input.value = ""
 
     def _canvas_transform(self) -> Tuple[float, float, float]:
         inner_width = self.canvas_size[0] - 2 * self.canvas_margin
@@ -485,6 +744,7 @@ class PlotterApp:
 
         pattern_items: List[str] = []
         if self.show_pattern_overlay and self.pattern.items:
+            pen_filter = self.preview_pen_choice if getattr(self, "preview_pen_choice", None) else "all"
             for item in self.pattern.items:
                 if isinstance(item, Polyline):
                     pts = list(reversed(item.pts)) if item._rev else list(item.pts)
@@ -495,6 +755,9 @@ class PlotterApp:
                 else:
                     continue
                 if len(pts) < 2:
+                    continue
+                pen_id = getattr(item, "pen_id", 0)
+                if pen_filter != "all" and str(pen_id) != str(pen_filter):
                     continue
                 canvas_pts = [self._world_to_canvas(px, py) for px, py in pts]
                 points_attr = " ".join(f"{cx:.1f},{cy:.1f}" for cx, cy in canvas_pts)
@@ -913,7 +1176,7 @@ class PlotterApp:
                 )
                 self.color_picker.disable()
             self.pot_select = ui.select(
-                options=[],
+                options={},
                 value=None,
                 with_input=False,
                 on_change=self._on_pot_selected,
@@ -924,53 +1187,171 @@ class PlotterApp:
     # Configuration and run panels
     # ------------------------------------------------------------------
     def _build_config_tab(self) -> None:
-        with ui.card().classes("p-2 gap-2"):
-            ui.label("Renderer configuration").classes("text-[12px] font-medium")
-            ui.toggle(options=["start", "centroid", "per_segment", "threshold"], value="per_segment").props(
-                "type=button unelevated toggle-color=primary label='z_mode'"
+        with ui.card().classes("p-3 gap-3 w-full"):
+            ui.label("Renderer Configuration").classes(
+                "text-[12px] font-semibold text-gray-700 uppercase tracking-wide"
             )
-            with ui.row().classes("gap-2"):
-                ui.number(label="z_threshold", value=0.02, min=0.0, max=1000.0, step=0.01)
-                ui.number(label="lift_delta", value=0.2, min=0.0, max=1.0, step=0.01)
-            with ui.row().classes("gap-2"):
-                ui.number(label="settle_down_s", value=0.05, min=0.0, max=5.0, step=0.01)
-                ui.number(label="settle_up_s", value=0.03, min=0.0, max=5.0, step=0.01)
-            with ui.row().classes("gap-2"):
-                ui.number(label="z_step", value=0.1, min=0.0, max=1.0, step=0.01)
-                ui.number(label="z_step_delay", value=0.03, min=0.0, max=1.0, step=0.005)
-            with ui.row().classes("gap-2"):
-                ui.number(label="flush_every", value=200, min=1, step=10)
-                ui.number(label="feed_travel", value=15000, min=1, step=100)
 
-            ui.separator()
-            ui.label("Run options").classes("text-[12px] font-medium")
-            with ui.row().classes("gap-2"):
-                ui.number(label="start_x", value=0.0, min=0.0, step=0.1)
-                ui.number(label="start_y", value=0.0, min=0.0, step=0.1)
-                ui.checkbox("optimize nn")
-            with ui.row().classes("gap-2"):
-                ui.checkbox("combine endpoints", value=True)
-                ui.number(label="join_tol", value=0.05, min=0.0, step=0.01)
-            with ui.row().classes("gap-2"):
-                ui.checkbox("resample", value=True)
-                ui.number(label="max_dev", value=0.1, min=0.0, step=0.01)
-                ui.input(label="max_seg (mm)")
+            def number_field(
+                label: str,
+                *,
+                value: float,
+                min_value: Optional[float] = None,
+                max_value: Optional[float] = None,
+                step: Optional[float] = None,
+                hint: Optional[str] = None,
+            ) -> None:
+                with ui.column().classes("gap-1"):
+                    with ui.row().classes("items-center justify-between gap-2"):
+                        ui.label(label).classes("text-[10px] text-gray-500")
+                        ui.number(
+                            value=value,
+                            min=min_value,
+                            max=max_value,
+                            step=step,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                    if hint:
+                        ui.label(hint).classes("text-[10px] text-gray-400 leading-tight")
+
+            with ui.column().classes("gap-3"):
+                with ui.column().classes("gap-2"):
+                    ui.label("Mode").classes("text-[11px] font-medium text-gray-600")
+                    ui.toggle(
+                        options=["start", "centroid", "per_segment", "threshold"],
+                        value="per_segment",
+                    ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
+                    number_field(
+                        "Z threshold",
+                        value=0.02,
+                        min_value=0.0,
+                        max_value=1000.0,
+                        step=0.01,
+                        hint="Only used with the 'threshold' z-mode.",
+                    )
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Pen Motion").classes("text-[11px] font-medium text-gray-600")
+                    number_field("Lift delta (mm)", value=0.2, min_value=0.0, max_value=1.0, step=0.01)
+                    number_field("Settle down (s)", value=0.05, min_value=0.0, max_value=5.0, step=0.01)
+                    number_field("Settle up (s)", value=0.03, min_value=0.0, max_value=5.0, step=0.01)
+                    number_field("Z step (mm)", value=0.1, min_value=0.0, max_value=1.0, step=0.01)
+                    number_field("Z step delay (s)", value=0.03, min_value=0.0, max_value=1.0, step=0.005)
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Optimization").classes("text-[11px] font-medium text-gray-600")
+                    ui.checkbox("Nearest-neighbour optimization", value=False).classes("text-[11px]")
+                    with ui.column().classes("gap-1 pl-2"):
+                        number_field(
+                            "Start X (mm)",
+                            value=0.0,
+                            min_value=0.0,
+                            step=0.1,
+                            hint="Only applied when NN optimization is enabled.",
+                        )
+                        number_field(
+                            "Start Y (mm)",
+                            value=0.0,
+                            min_value=0.0,
+                            step=0.1,
+                        )
+                    with ui.row().classes("items-start justify-between gap-2"):
+                        ui.checkbox("Combine endpoints", value=True).classes("text-[11px]")
+                        ui.number(
+                            label="Join tol (mm)",
+                            value=0.05,
+                            min=0.0,
+                            step=0.01,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                    with ui.column().classes("gap-1"):
+                        with ui.row().classes("items-center justify-between gap-2"):
+                            ui.checkbox("Resample paths", value=True).classes("text-[11px]")
+                            ui.number(
+                                label="Max dev (mm)",
+                                value=0.1,
+                                min=0.0,
+                                step=0.01,
+                            ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Miscellaneous").classes("text-[11px] font-medium text-gray-600")
+                    number_field("Flush every (cmds)", value=200.0, min_value=1.0, step=10.0)
+                    number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
 
     def _build_run_tab(self) -> None:
-        with ui.card().classes("p-2 gap-2"):
-            ui.label("Pen filter").classes("text-[12px] font-medium")
-            ui.select(options=[], with_input=False, multiple=True).props(
-                "hint='Populated after preview' label='Pens'"
-            )
+        with ui.card().classes("p-2 gap-3"):
+            ui.label("Preview & Run").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
+            self.pen_filter_select = ui.select(
+                options=[],
+                value=None,
+                with_input=False,
+                on_change=self._on_pen_filter_changed,
+            ).props("label='Pen' dense").classes("w-full text-[11px]")
 
             with ui.row().classes("gap-2"):
-                ui.button("Preview in overlay", color="info", on_click=lambda: self._notify("Preview requested."))
+                ui.button("Preview in overlay", color="info", on_click=self._preview_selected_pen)
                 ui.button("Start", color="positive", on_click=lambda: self._notify("Run started."))
                 ui.button("Pause", on_click=lambda: self._notify("Run paused/resumed."))
                 ui.button("Stop", color="negative", on_click=lambda: self._notify("Run stopped."))
 
             self.progress = ui.linear_progress(value=0.0).props("color=primary")
             self.progress_label = ui.label("Idle").classes("text-[11px]")
+            self._update_pen_filter_options()
+
+    def _pen_ids_in_pattern(self) -> List[int]:
+        pen_ids: set[int] = set()
+        for item in self.pattern.items:
+            pen_id = getattr(item, "pen_id", None)
+            if pen_id is None:
+                continue
+            try:
+                pen_ids.add(int(pen_id))
+            except (TypeError, ValueError):
+                continue
+        return sorted(pen_ids)
+
+    def _pen_filter_options(self) -> List[Dict[str, Any]]:
+        options: List[Dict[str, Any]] = [{"label": "All", "value": "all"}]
+        for pen_id in self._pen_ids_in_pattern():
+            value = str(pen_id)
+            options.append({"label": value, "value": value})
+        return options
+
+    def _update_pen_filter_options(self) -> None:
+        option_entries = self._pen_filter_options()
+        options = [
+            (opt if isinstance(opt, dict) else {"label": str(opt), "value": str(opt)})
+            for opt in option_entries
+        ]
+        valid_values = {str(opt["value"]) for opt in options}
+        if str(self.preview_pen_choice) not in valid_values:
+            self.preview_pen_choice = "all"
+        if self.pen_filter_select is not None:
+            self.pen_filter_select.options = options
+            self.pen_filter_select.value = self.preview_pen_choice
+            self.pen_filter_select.update()
+
+    def _on_pen_filter_changed(self, event: events.ValueChangeEventArguments) -> None:
+        value = event.value or "all"
+        self.preview_pen_choice = str(value)
+        self._update_canvas()
+
+    def _preview_selected_pen(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        selected = self.preview_pen_choice or "all"
+        if selected != "all":
+            pen_ids = {str(pid) for pid in self._pen_ids_in_pattern()}
+            if selected not in pen_ids:
+                ui.notify(f"Pen {selected} not present in current pattern.", color="warning")
+                return
+        self._update_canvas()
+        if selected == "all":
+            message = "Preview updated to show all pens."
+        else:
+            message = f"Preview updated to show pen {selected}."
+        ui.notify(message, color="positive")
+        self._log_status(message)
 
     def _build_load_tab(self) -> None:
         with ui.card().classes("p-2 gap-3 w-full"):
@@ -1048,6 +1429,16 @@ class PlotterApp:
                             label,
                             on_click=lambda dy=offset: self._translate_pattern(0.0, dy),
                         ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Flip").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    ui.button(
+                        "X",
+                        on_click=lambda: self._flip_pattern("x"),
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Y",
+                        on_click=lambda: self._flip_pattern("y"),
+                    ).props("outline size='xs' dense").classes(button_classes)
 
     async def _handle_svg_upload(self, event: events.UploadEventArguments) -> None:
         uploads: List[Any] = []
@@ -1091,7 +1482,9 @@ class PlotterApp:
         self.pattern = Pattern()
         self.pattern_has_data = False
         self.pattern_name = "Empty"
+        self.preview_pen_choice = "all"
         self._update_pattern_summary()
+        self._update_pen_filter_options()
         self._update_canvas()
         ui.notify("Pattern cleared.", color="info")
         self._log_status("Cleared current pattern.")
@@ -1154,7 +1547,9 @@ class PlotterApp:
         self.pattern = sanitized
         self.pattern_has_data = bool(self.pattern.items)
         self.pattern_name = source_name
+        self.preview_pen_choice = "all"
         self._update_pattern_summary()
+        self._update_pen_filter_options()
         self._update_canvas()
 
     def _clone_pattern_item(self, item: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
@@ -1305,6 +1700,24 @@ class PlotterApp:
 
         self._apply_pattern_transform(transform)
         self._log_status(f"Shifted pattern by Δx={dx:+.1f}, Δy={dy:+.1f}.")
+
+    def _flip_pattern(self, axis: str) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        cx, cy = self._pattern_center()
+        axis = axis.lower()
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            if axis == "x":
+                return (2 * cx - x, y)
+            if axis == "y":
+                return (x, 2 * cy - y)
+            return (x, y)
+
+        self._apply_pattern_transform(transform)
+        axis_name = "X-axis" if axis == "x" else "Y-axis"
+        self._log_status(f"Flipped pattern across {axis_name}.")
 
     def _parse_pattern_script(self, script_text: str) -> Pattern:
         pattern = Pattern()
@@ -1637,10 +2050,6 @@ class PlotterApp:
             self.selection_label.text = "No selection"
         self._update_status_panels()
 
-    def _on_workpiece_change(self, e: events.ValueChangeEventArguments) -> None:
-        self.state.workpiece = e.value
-        self._notify(f"Workpiece changed to {e.value}.")
-
     def _on_height_change(self, e: events.ValueChangeEventArguments) -> None:
         if self._suppress_height_event:
             return
@@ -1663,9 +2072,6 @@ class PlotterApp:
         self._update_canvas()
 
     def _quick_size(self, size: str) -> None:
-        self.state.workpiece = size
-        if self.workpiece_select is not None:
-            self.workpiece_select.value = size
         presets = {
             "A4": (297.0, 210.0),
             "A5": (210.0, 148.0),
@@ -1763,13 +2169,9 @@ class PlotterApp:
     def _refresh_pots(self, selected_id: Optional[int] = None) -> None:
         if self.pot_select is None:
             return
-        options = [
-            {
-                "label": f"Pot #{p.identifier} (Z {p.height:.2f})",
-                "value": str(p.identifier),
-            }
-            for p in self.state.pots
-        ]
+        options = {
+            f"Pot #{p.identifier} (Z {p.height:.2f})": str(p.identifier) for p in self.state.pots
+        }
         self.pot_select.options = options
         valid_ids = {p.identifier for p in self.state.pots}
         if selected_id is not None:
