@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from nicegui import events, ui
 
 from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS, Renderer, RendererCancelled
-from penplot_helper import Config, GRBL
+from penplot_helper import Config, GRBL, Compensation, Rect
 
 try:
     from serial.tools import list_ports
@@ -642,7 +642,10 @@ class PlotterApp:
         if not self._require_grbl(alert=True):
             return
         await self._set_pen_height(1.0, alert=False)
-        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True))
+        homed = await self._execute_grbl("Homing axes", lambda g: g.cmd("$H"))
+        if homed is not None:
+            self._log_status("Homing sequence complete.")
+        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
         if result is not None:
             self._log_status("Moved to origin (0,0) with pen up.")
 
@@ -711,6 +714,7 @@ class PlotterApp:
         self.grbl = grbl
         self.grbl_config = grbl.cfg
         self._is_connecting = False
+        self._sync_grbl_compensation()
         success_text = f"Connected to {grbl.cfg.port} @ {grbl.cfg.baudrate}"
         self._append_comms_log(success_text)
         ui.notify(f"Connected to {grbl.cfg.port}", color="positive")
@@ -1227,6 +1231,7 @@ class PlotterApp:
 
         self.state.rect_min = (min_x, min_y)
         self.state.rect_max = (max_x, max_y)
+        self._sync_grbl_compensation()
 
     def _update_pot_position(self, identifier: int, x: float, y: float) -> None:
         clamped_x = max(0.0, min(self.state.bed_width, x))
@@ -1306,6 +1311,7 @@ class PlotterApp:
         self.state.z_height = target_height
         if kind == "corner":
             self._schedule_pen_height(target_height)
+            self._sync_grbl_compensation()
         self._update_selection_label()
         self._update_canvas()
     # ------------------------------------------------------------------
@@ -1452,6 +1458,7 @@ class PlotterApp:
                     self.cfg_flush_every = number_field("Flush every (cmds)", value=200.0, min_value=1.0, step=10.0)
                     self.cfg_travel_feed = number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
                     self.cfg_default_feed_draw = number_field("Default draw feed (mm/min)", value=4000.0, min_value=1.0, step=100.0)
+                    self.cfg_default_pen_pressure = number_field("Default pen pressure", value=-0.1, min_value=-1.0, max_value=1.0, step=0.01)
 
     def _build_run_tab(self) -> None:
         with ui.card().classes("p-2 gap-3"):
@@ -1553,6 +1560,26 @@ class PlotterApp:
         except Exception as exc:
             self._append_comms_log(f"[error] {description} failed: {exc}")
 
+    def _sync_grbl_compensation(self) -> None:
+        if not self._is_grbl_ready():
+            return
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        if max_x <= min_x or max_y <= min_y:
+            return
+        heights = self.state.corner_heights
+        try:
+            comp = Compensation(
+                area=Rect(min_x, min_y, max_x, max_y),
+                hBL=float(heights.get("BL", 1.0)),
+                hBR=float(heights.get("BR", 1.0)),
+                hTL=float(heights.get("TL", 1.0)),
+                hTR=float(heights.get("TR", 1.0)),
+            )
+            self.grbl.set_compensation(comp)
+        except Exception as exc:
+            self._append_comms_log(f"[error] Failed to update compensation: {exc}")
+
     def _label_for_pen_choice(self, choice: str) -> str:
         return "All pens" if choice in (None, "", "all") else f"Pen {choice}"
 
@@ -1582,6 +1609,7 @@ class PlotterApp:
         travel_feed = self._int_value(self.cfg_travel_feed, None)
         lift_delta = self._float_value(self.cfg_lift_delta, 0.2)
         default_feed = self._int_value(self.cfg_default_feed_draw, None)
+        default_pen_pressure = self._float_value(self.cfg_default_pen_pressure, -0.1)
 
         start_x = self._float_value(self.cfg_start_x, 0.0)
         start_y = self._float_value(self.cfg_start_y, 0.0)
@@ -1622,6 +1650,7 @@ class PlotterApp:
                 'pen_colors': DEFAULT_PEN_COLORS,
             },
             'default_feed': default_feed,
+            'default_pen_pressure': default_pen_pressure,
             'start_xy': (start_x, start_y),
             'optimize': optimize,
             'resample': resample,
@@ -1630,13 +1659,19 @@ class PlotterApp:
             'return_home': True,
         }
 
-    def _clone_pattern_for_run(self, default_feed: Optional[int]) -> Pattern:
+    def _clone_pattern_for_run(self, default_feed: Optional[int], default_pen_pressure: float) -> Pattern:
         clone = Pattern()
         for item in self.pattern.items:
             cloned = self._clone_pattern_item(item)
-            if isinstance(cloned, Polyline) and (cloned.feed_draw is None or cloned.feed_draw <= 0):
-                if default_feed is not None:
+            if isinstance(cloned, Polyline):
+                if (cloned.feed_draw is None or cloned.feed_draw <= 0) and default_feed is not None:
                     cloned.feed_draw = int(default_feed)
+                try:
+                    pen_pressure = float(cloned.pen_pressure)
+                except (TypeError, ValueError):
+                    pen_pressure = -0.1
+                if abs(pen_pressure - (-0.1)) < 1e-6:
+                    cloned.pen_pressure = float(default_pen_pressure)
             clone.add(cloned)
         return clone
 
@@ -1651,7 +1686,7 @@ class PlotterApp:
             return
 
         settings = self._collect_run_settings()
-        pattern_clone = self._clone_pattern_for_run(settings['default_feed'])
+        pattern_clone = self._clone_pattern_for_run(settings['default_feed'], settings['default_pen_pressure'])
         if settings['default_feed'] is not None and hasattr(self.grbl, 'cfg'):
             try:
                 self.grbl.cfg.feed_draw = int(settings['default_feed'])
@@ -2496,6 +2531,7 @@ class PlotterApp:
                 corner_key = str(key)
                 self.state.corner_heights[corner_key] = height
                 self._log_status(f"Set corner {corner_key} height to {height:.2f}.")
+                self._sync_grbl_compensation()
             elif kind == "pot":
                 pot = next((p for p in self.state.pots if p.identifier == int(key)), None)
                 if pot:
@@ -2520,6 +2556,7 @@ class PlotterApp:
         min_y = 0.0
         self.state.rect_min = (min_x, min_y)
         self.state.rect_max = (min_x + width, min_y + height)
+        self._sync_grbl_compensation()
         self._update_canvas()
         self._update_selection_label()
         self._log_status(f"Configured work area preset: {size} ({width:.0f} × {height:.0f} mm).")
