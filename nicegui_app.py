@@ -16,7 +16,7 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 import re
 import xml.etree.ElementTree as ET
@@ -130,6 +130,11 @@ class PlotterApp:
             self.grbl_config.port = serial_device
         self._is_connecting = False
         self.serial_port_map: Dict[str, str] = {}
+        self._grbl_lock = asyncio.Lock()
+        self._pending_move_target: Optional[Tuple[float, float]] = None
+        self._pending_move_task: Optional[asyncio.Task] = None
+        self._pending_pen_value: Optional[float] = None
+        self._pending_pen_task: Optional[asyncio.Task] = None
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -277,10 +282,10 @@ class PlotterApp:
                 self.area_label = ui.label("").classes("text-[10px] text-gray-500")
             with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
                 ui.label("Jog & Controls").classes("text-[10px] uppercase tracking-wide text-gray-500")
-                self._compact_button("Home", lambda: self._notify("Homed axes."))
-                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."))
-                self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
-                self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
+                self._compact_button("Home", lambda: self._spawn(self._home_axes()))
+                self._compact_button("Sweep", lambda: self._spawn(self._sweep_work_area()))
+                self._compact_button("Pen Up", lambda: self._spawn(self._pen_button_action(1.0)))
+                self._compact_button("Pen Down", lambda: self._spawn(self._pen_button_action(0.0)))
                 self.area_toggle = self._toggle_button("Area", self._toggle_area, self.show_area_overlay)
                 self.pattern_toggle = self._toggle_button("Pattern", self._toggle_pattern, self.show_pattern_overlay)
                 self.pots_toggle = self._toggle_button("Pots", self._toggle_pots, self.show_pots_overlay)
@@ -422,6 +427,7 @@ class PlotterApp:
                 ports = list(list_ports.comports())
             except Exception as exc:  # pragma: no cover
                 self._append_comms_log(f"[error] Unable to enumerate serial ports: {exc}")
+        old_map = dict(self.serial_port_map)
         self.serial_port_map = {}
         label_by_device: Dict[str, str] = {}
         option_labels: List[str] = []
@@ -434,10 +440,11 @@ class PlotterApp:
             label = str(label)
             device_value = str(device)
             self.serial_port_map[label] = device_value
+            self.serial_port_map[device_value] = device_value
             label_by_device[device_value] = label
             option_labels.append(label)
         previous_label = self.serial_select.value
-        previous_device = self.serial_port_map.get(previous_label, previous_label) if previous_label else None
+        previous_device = old_map.get(previous_label, previous_label) if previous_label else None
         self.serial_select.options = option_labels
         preferred = None
         if self.grbl and self.grbl.ser and getattr(self.grbl.ser, "port", None):
@@ -531,6 +538,121 @@ class PlotterApp:
         self._update_comms_log_display()
         self._append_comms_log("Log cleared.")
 
+    def _is_grbl_ready(self) -> bool:
+        return bool(self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False))
+
+    def _require_grbl(self, *, alert: bool = True) -> Optional[GRBL]:
+        if self._is_grbl_ready():
+            return self.grbl
+        if alert:
+            ui.notify("Connect to the plotter first.", color="warning")
+        return None
+
+    async def _execute_grbl(self, description: str, worker: Callable[[GRBL], Any], *, alert: bool = True) -> Optional[Any]:
+        grbl = self._require_grbl(alert=alert)
+        if not grbl:
+            return None
+        async with self._grbl_lock:
+            self._append_comms_log(description)
+            try:
+                result = await asyncio.to_thread(worker, grbl)
+            except Exception as exc:
+                error_text = f"{description} failed: {exc}"
+                self._append_comms_log(f"[error] {error_text}")
+                ui.notify(error_text, color="negative")
+                return None
+            else:
+                return result
+
+    def _spawn(self, coro: Awaitable[Any]) -> None:
+        asyncio.create_task(coro)
+
+    def _schedule_position_move(self, x: float, y: float, *, alert: bool = False) -> None:
+        if not self._require_grbl(alert=alert):
+            return
+        self._pending_move_target = (float(x), float(y))
+        if self._pending_move_task is None:
+            self._pending_move_task = asyncio.create_task(self._flush_pending_move())
+
+    async def _flush_pending_move(self) -> None:
+        try:
+            while True:
+                target = self._pending_move_target
+                await asyncio.sleep(0.12)
+                if target == self._pending_move_target and target is not None:
+                    await self._move_to_position(*target)
+                    self._pending_move_target = None
+                    return
+        finally:
+            self._pending_move_task = None
+
+    async def _move_to_position(self, x: float, y: float) -> None:
+        await self._execute_grbl(
+            f"Move to ({x:.1f}, {y:.1f})",
+            lambda g: g.move_xy(x=x, y=y, wait=True),
+            alert=False,
+        )
+
+    def _schedule_pen_height(self, pos: float) -> None:
+        if not self._require_grbl(alert=False):
+            return
+        self._pending_pen_value = float(max(0.0, min(1.0, pos)))
+        if self._pending_pen_task is None:
+            self._pending_pen_task = asyncio.create_task(self._flush_pending_pen())
+
+    async def _flush_pending_pen(self) -> None:
+        try:
+            while True:
+                value = self._pending_pen_value
+                await asyncio.sleep(0.08)
+                if value == self._pending_pen_value and value is not None:
+                    await self._set_pen_height(value)
+                    self._pending_pen_value = value
+                    return
+        finally:
+            self._pending_pen_task = None
+
+    async def _set_pen_height(self, pos: float, *, alert: bool = False) -> None:
+        await self._execute_grbl(
+            f"Set pen height to {pos:.2f}",
+            lambda g: g.pen_set(pos, step=0.05, step_delay_s=0.02, wait=False),
+            alert=alert,
+        )
+
+    async def _pen_button_action(self, target: float) -> None:
+        if not self._require_grbl(alert=True):
+            return
+        target = float(max(0.0, min(1.0, target)))
+        self.state.z_height = target
+        if self.z_slider is not None:
+            try:
+                self._suppress_height_event = True
+                self.z_slider.value = target
+            finally:
+                self._suppress_height_event = False
+        await self._set_pen_height(target, alert=False)
+        self._log_status(f"Pen moved to {target:.2f} height.")
+
+    async def _home_axes(self) -> None:
+        result = await self._execute_grbl("Homing axes", lambda g: g.cmd("$H"))
+        if result is not None:
+            self._log_status("Homing command sent.")
+
+    async def _sweep_work_area(self) -> None:
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        width = max(0.0, max_x - min_x)
+        height = max(0.0, max_y - min_y)
+        if width <= 0.0 or height <= 0.0:
+            ui.notify("Define a valid work area before sweeping.", color="warning")
+            return
+        desc = f"Sweeping work area {width:.1f} × {height:.1f} mm"
+        result = await self._execute_grbl(desc, lambda g: g.sweep_rect(width, height, min_x, min_y))
+        if result is not None:
+            self._log_status(
+                f"Swept work area from ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})."
+            )
+
     def _connect_grbl_sync(self, port: str) -> GRBL:
         cfg_data = vars(self.grbl_config).copy()
         cfg_data["port"] = port
@@ -601,17 +723,11 @@ class PlotterApp:
             ui.notify("Enter at least one G-code command.", color="warning")
             return
         for command in commands:
-            self._append_comms_log(f"> {command}")
-            try:
-                responses = await asyncio.to_thread(self.grbl.cmd, command)
-            except Exception as exc:
-                error_text = f"G-code error: {exc}"
-                self._append_comms_log(f"[error] {error_text}")
-                ui.notify(error_text, color="negative")
+            responses = await self._execute_grbl(f"> {command}", lambda g, cmd=command: g.cmd(cmd), alert=False)
+            if responses is None:
                 break
-            else:
-                for line in responses:
-                    self._append_comms_log(line)
+            for line in responses:
+                self._append_comms_log(line)
         self._update_comms_status()
         if self.gcode_input is not None:
             self.gcode_input.value = ""
@@ -946,6 +1062,9 @@ class PlotterApp:
         previous = self.state.selected_entity
         if previous != target:
             self._select_entity(target)
+            pos = self._entity_world_position(target)
+            if pos is not None:
+                self._schedule_position_move(*pos, alert=True)
             if self._is_entity_draggable(target):
                 self.state.drag_arm = target
             return
@@ -1001,6 +1120,22 @@ class PlotterApp:
             if pot:
                 x, y = pot.position
                 self._log_status(f"Jogging to pot #{pot.identifier} at ({x:.1f}, {y:.1f}).")
+        pos = self._entity_world_position(entity)
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=True)
+
+    def _entity_world_position(self, entity: Tuple[str, Union[str, int]]) -> Optional[Tuple[float, float]]:
+        normalized = self._normalize_entity(entity)
+        if normalized is None:
+            return None
+        kind, key = normalized
+        if kind == "corner":
+            return self._corner_world_coords(str(key))
+        if kind == "pot":
+            pot = next((p for p in self.state.pots if p.identifier == int(key)), None)
+            if pot:
+                return pot.position
+        return None
 
     def _apply_jog(self, entity: Tuple[str, Union[str, int]], dx: float, dy: float) -> None:
         normalized = self._normalize_entity(entity)
@@ -1029,6 +1164,9 @@ class PlotterApp:
             new_y = max(0.0, min(self.state.bed_height, pot.position[1] + dy))
             pot.position = (new_x, new_y)
             self._log_status(f"Jogged pot #{pot.identifier} to ({new_x:.1f}, {new_y:.1f}).")
+        pos = self._entity_world_position((kind, key))
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=False)
         self._update_canvas()
         self._update_selection_label()
 
@@ -1044,6 +1182,9 @@ class PlotterApp:
             self._update_pot_position(int(key), x, y)
         self._update_canvas()
         self._update_selection_label()
+        pos = self._entity_world_position((kind, key))
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=False)
 
     def _update_corner_position(self, key: str, x: float, y: float) -> None:
         key = str(key)
@@ -2070,6 +2211,7 @@ class PlotterApp:
                     self._refresh_pots(selected_id=pot.identifier)
         self._update_selection_label()
         self._update_canvas()
+        self._schedule_pen_height(height)
 
     def _quick_size(self, size: str) -> None:
         presets = {
