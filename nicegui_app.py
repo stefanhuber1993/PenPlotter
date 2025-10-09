@@ -283,7 +283,6 @@ class PlotterApp:
             with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
                 ui.label("Jog & Controls").classes("text-[10px] uppercase tracking-wide text-gray-500")
                 self._compact_button("Home", lambda: self._spawn(self._home_axes()))
-                self._compact_button("Sweep", lambda: self._spawn(self._sweep_work_area()))
                 self._compact_button("Pen Up", lambda: self._spawn(self._pen_button_action(1.0)))
                 self._compact_button("Pen Down", lambda: self._spawn(self._pen_button_action(0.0)))
                 self.area_toggle = self._toggle_button("Area", self._toggle_area, self.show_area_overlay)
@@ -356,7 +355,7 @@ class PlotterApp:
             with ui.card().classes("p-2 gap-2"):
                 ui.label("Work Area Utilities").classes("text-[10px] uppercase tracking-wide text-gray-500")
                 with ui.row().classes("gap-2 flex-wrap text-[11px]"):
-                    self._compact_button("Sweep Area", lambda: self._notify("Swept work area."))
+                    self._compact_button("Sweep Area", lambda: self._spawn(self._sweep_selected_area()))
                     self._compact_button("Reset Z Heights", self._reset_all_z_heights)
             with ui.card().classes("p-2 gap-3 items-center"):
                 ui.label("Z Height").classes("text-[10px] uppercase tracking-wide text-gray-500")
@@ -545,7 +544,10 @@ class PlotterApp:
         if self._is_grbl_ready():
             return self.grbl
         if alert:
-            ui.notify("Connect to the plotter first.", color="warning")
+            try:
+                ui.notify("Connect to the plotter first.", color="warning")
+            except RuntimeError:
+                pass
         return None
 
     async def _execute_grbl(self, description: str, worker: Callable[[GRBL], Any], *, alert: bool = True) -> Optional[Any]:
@@ -559,7 +561,11 @@ class PlotterApp:
             except Exception as exc:
                 error_text = f"{description} failed: {exc}"
                 self._append_comms_log(f"[error] {error_text}")
-                ui.notify(error_text, color="negative")
+                if alert:
+                    try:
+                        ui.notify(error_text, color="negative")
+                    except RuntimeError:
+                        pass
                 return None
             else:
                 return result
@@ -578,7 +584,7 @@ class PlotterApp:
         try:
             while True:
                 target = self._pending_move_target
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(0.024)
                 if target == self._pending_move_target and target is not None:
                     await self._move_to_position(*target)
                     self._pending_move_target = None
@@ -604,7 +610,7 @@ class PlotterApp:
         try:
             while True:
                 value = self._pending_pen_value
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(0.016)
                 if value == self._pending_pen_value and value is not None:
                     await self._set_pen_height(value)
                     self._pending_pen_value = value
@@ -623,13 +629,6 @@ class PlotterApp:
         if not self._require_grbl(alert=True):
             return
         target = float(max(0.0, min(1.0, target)))
-        self.state.z_height = target
-        if self.z_slider is not None:
-            try:
-                self._suppress_height_event = True
-                self.z_slider.value = target
-            finally:
-                self._suppress_height_event = False
         await self._set_pen_height(target, alert=False)
         self._log_status(f"Pen moved to {target:.2f} height.")
 
@@ -637,6 +636,8 @@ class PlotterApp:
         result = await self._execute_grbl("Homing axes", lambda g: g.cmd("$H"))
         if result is not None:
             self._log_status("Homing command sent.")
+            await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
+            await self._set_pen_height(1.0, alert=False)
 
     async def _sweep_work_area(self) -> None:
         min_x, min_y = self.state.rect_min
@@ -651,6 +652,21 @@ class PlotterApp:
         if result is not None:
             self._log_status(
                 f"Swept work area from ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})."
+            )
+
+    async def _sweep_selected_area(self) -> None:
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        width = max(0.0, max_x - min_x)
+        height = max(0.0, max_y - min_y)
+        if width <= 0.0 or height <= 0.0:
+            ui.notify("Define a valid work area before sweeping.", color="warning")
+            return
+        desc = f"Sweeping selected area {width:.1f} × {height:.1f} mm"
+        result = await self._execute_grbl(desc, lambda g: g.sweep_rect(width, height, min_x, min_y))
+        if result is not None:
+            self._log_status(
+                f"Swept selected area from ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})."
             )
 
     def _connect_grbl_sync(self, port: str) -> GRBL:
@@ -701,6 +717,8 @@ class PlotterApp:
                 ui.notify("No active connection.", color="warning")
             return
         grbl = self.grbl
+        await self._execute_grbl("Move to origin before disconnect", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
+        await self._set_pen_height(0.0, alert=False)
         self.grbl = None
         await asyncio.to_thread(grbl.close)
         message = f"Disconnected from {grbl.cfg.port}"
@@ -1279,6 +1297,8 @@ class PlotterApp:
             finally:
                 self._suppress_height_event = False
         self.state.z_height = target_height
+        if kind == "corner":
+            self._schedule_pen_height(target_height)
         self._update_selection_label()
         self._update_canvas()
     # ------------------------------------------------------------------
@@ -1426,10 +1446,9 @@ class PlotterApp:
                 value=None,
                 with_input=False,
                 on_change=self._on_pen_filter_changed,
-            ).props("label='Pen' dense").classes("w-full text-[11px]")
+            ).props("label='Pen' dense emit-value map-options option-label='label' option-value='value'").classes("w-full text-[11px]")
 
             with ui.row().classes("gap-2"):
-                ui.button("Preview in overlay", color="info", on_click=self._preview_selected_pen)
                 ui.button("Start", color="positive", on_click=lambda: self._notify("Run started."))
                 ui.button("Pause", on_click=lambda: self._notify("Run paused/resumed."))
                 ui.button("Stop", color="negative", on_click=lambda: self._notify("Run stopped."))
@@ -1451,18 +1470,13 @@ class PlotterApp:
         return sorted(pen_ids)
 
     def _pen_filter_options(self) -> List[Dict[str, Any]]:
-        options: List[Dict[str, Any]] = [{"label": "All", "value": "all"}]
+        options: List[Dict[str, Any]] = [{"label": "All pens", "value": "all"}]
         for pen_id in self._pen_ids_in_pattern():
-            value = str(pen_id)
-            options.append({"label": value, "value": value})
+            options.append({"label": f"Pen {pen_id}", "value": str(pen_id)})
         return options
 
     def _update_pen_filter_options(self) -> None:
-        option_entries = self._pen_filter_options()
-        options = [
-            (opt if isinstance(opt, dict) else {"label": str(opt), "value": str(opt)})
-            for opt in option_entries
-        ]
+        options = self._pen_filter_options()
         valid_values = {str(opt["value"]) for opt in options}
         if str(self.preview_pen_choice) not in valid_values:
             self.preview_pen_choice = "all"
