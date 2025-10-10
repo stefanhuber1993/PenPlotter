@@ -89,6 +89,7 @@ class PlotterApp:
         self.status_log = None
         self.pot_select = None
         self.progress = None
+        self.pattern_display_width = 1.5
         self.progress_label = None
         self.color_picker = None
         self.canvas = None
@@ -135,6 +136,7 @@ class PlotterApp:
         self._pending_move_task: Optional[asyncio.Task] = None
         self._pending_pen_value: Optional[float] = None
         self._pending_pen_task: Optional[asyncio.Task] = None
+        self._active_pen_height: float = 1.0
         self.renderer: Optional[Renderer] = None
         self.run_task: Optional[asyncio.Task] = None
         self.run_paused: bool = False
@@ -329,21 +331,21 @@ class PlotterApp:
             with ui.tabs().classes("text-[10px] flex gap-2 !px-0 w-full").style(
                 "flex-wrap: wrap; row-gap: 6px;"
             ) as tabs:
-                tab_area = ui.tab("Area").classes("px-2 py-1 text-[10px]")
-                tab_load = ui.tab("Load").classes("px-2 py-1 text-[10px]")
-                tab_pots = ui.tab("Pots").classes("px-2 py-1 text-[10px]")
                 tab_comms = ui.tab("Comms").classes("px-2 py-1 text-[10px]")
+                tab_area = ui.tab("Area").classes("px-2 py-1 text-[10px]")
+                tab_pots = ui.tab("Pots").classes("px-2 py-1 text-[10px]")
+                tab_load = ui.tab("Load").classes("px-2 py-1 text-[10px]")
                 tab_config = ui.tab("Config").classes("px-2 py-1 text-[10px]")
                 tab_run = ui.tab("Run").classes("px-2 py-1 text-[10px]")
-            with ui.tab_panels(tabs, value=tab_area).classes("h-full text-[11px]"):
-                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-2"):
-                    self._build_area_controls()
-                with ui.tab_panel(tab_load).classes("h-full overflow-y-auto p-2"):
-                    self._build_load_tab()
-                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-2"):
-                    self._build_pot_controls()
+            with ui.tab_panels(tabs, value=tab_comms).classes("h-full text-[11px]"):
                 with ui.tab_panel(tab_comms).classes("h-full overflow-y-auto p-2"):
                     self._build_comms_tab()
+                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-2"):
+                    self._build_area_controls()
+                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-2"):
+                    self._build_pot_controls()
+                with ui.tab_panel(tab_load).classes("h-full overflow-y-auto p-2"):
+                    self._build_load_tab()
                 with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-2"):
                     self._build_config_tab()
                 with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-2"):
@@ -579,7 +581,14 @@ class PlotterApp:
     def _spawn(self, coro: Awaitable[Any]) -> None:
         asyncio.create_task(coro)
 
-    def _schedule_position_move(self, x: float, y: float, *, alert: bool = False) -> None:
+    def _enter_safe_pen_mode(self) -> None:
+        current = self._pending_pen_value if self._pending_pen_value is not None else self._active_pen_height
+        if current is None or current < 0.99:
+            self._schedule_pen_height(1.0)
+
+    def _schedule_position_move(self, x: float, y: float, *, alert: bool = False, safe: bool = True) -> None:
+        if safe:
+            self._enter_safe_pen_mode()
         if not self._require_grbl(alert=alert):
             return
         self._pending_move_target = (float(x), float(y))
@@ -630,6 +639,7 @@ class PlotterApp:
             lambda g: g.pen_set(pos, step=0.05, step_delay_s=0.02, wait=False),
             alert=alert,
         )
+        self._active_pen_height = float(max(0.0, min(1.0, pos)))
 
     async def _pen_button_action(self, target: float) -> None:
         if not self._require_grbl(alert=True):
@@ -905,7 +915,7 @@ class PlotterApp:
                 points_attr = " ".join(f"{cx:.1f},{cy:.1f}" for cx, cy in canvas_pts)
                 color = DEFAULT_PEN_COLORS.get(getattr(item, "pen_id", 0), "#2563eb")
                 pattern_items.append(
-                    f'<polyline points="{points_attr}" class="pattern-stroke" stroke="{color}" />'
+                    f'<polyline points="{points_attr}" class="pattern-stroke" stroke="{color}" stroke-width="{self.pattern_display_width}" />'
                 )
 
         jog_items = []
@@ -930,7 +940,7 @@ class PlotterApp:
           <defs>
             <style>
               .grid-line {{ stroke: #d1d5db; stroke-width: 1; }}
-              .pattern-stroke {{ fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }}
+              .pattern-stroke {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}
             </style>
           </defs>
           <rect x="{bed_left:.1f}" y="{bed_top:.1f}" width="{bed_width_px:.1f}" height="{bed_height_px:.1f}" fill="#f8fafc" stroke="#4b5563" stroke-width="2" rx="12" />
@@ -1090,7 +1100,7 @@ class PlotterApp:
             self._select_entity(target)
             pos = self._entity_world_position(target)
             if pos is not None:
-                self._schedule_position_move(*pos, alert=True)
+                self._schedule_position_move(*pos, alert=True, safe=True)
             if self._is_entity_draggable(target):
                 self.state.drag_arm = target
             return
@@ -1106,6 +1116,7 @@ class PlotterApp:
             self.state.drag_has_moved = False
             self._last_pointer_pos = (cx, cy)
             self.state.drag_arm = None
+            self._enter_safe_pen_mode()
         else:
             self.state.drag_entity = None
             self.state.drag_has_moved = False
@@ -1148,7 +1159,7 @@ class PlotterApp:
                 self._log_status(f"Jogging to pot #{pot.identifier} at ({x:.1f}, {y:.1f}).")
         pos = self._entity_world_position(entity)
         if pos is not None:
-            self._schedule_position_move(*pos, alert=True)
+            self._schedule_position_move(*pos, alert=True, safe=True)
 
     def _entity_world_position(self, entity: Tuple[str, Union[str, int]]) -> Optional[Tuple[float, float]]:
         normalized = self._normalize_entity(entity)
@@ -1192,7 +1203,7 @@ class PlotterApp:
             self._log_status(f"Jogged pot #{pot.identifier} to ({new_x:.1f}, {new_y:.1f}).")
         pos = self._entity_world_position((kind, key))
         if pos is not None:
-            self._schedule_position_move(*pos, alert=False)
+            self._schedule_position_move(*pos, alert=False, safe=False)
         self._update_canvas()
         self._update_selection_label()
 
@@ -1210,7 +1221,7 @@ class PlotterApp:
         self._update_selection_label()
         pos = self._entity_world_position((kind, key))
         if pos is not None:
-            self._schedule_position_move(*pos, alert=False)
+            self._schedule_position_move(*pos, alert=False, safe=True)
 
     def _update_corner_position(self, key: str, x: float, y: float) -> None:
         key = str(key)
@@ -1307,7 +1318,6 @@ class PlotterApp:
                 self._suppress_height_event = False
         self.state.z_height = target_height
         if kind == "corner":
-            self._schedule_pen_height(target_height)
             self._sync_grbl_compensation()
         self._update_selection_label()
         self._update_canvas()
@@ -1387,22 +1397,36 @@ class PlotterApp:
 
             with ui.column().classes("gap-3"):
                 with ui.column().classes("gap-2"):
+                    ui.label("Travel").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_travel_feed = number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
+                    self.cfg_default_feed_draw = number_field("Default draw feed (mm/min)", value=4000.0, min_value=1.0, step=100.0)
+                    self.cfg_flush_every = number_field(
+                        "Flush every (segments)",
+                        value=200.0,
+                        min_value=1.0,
+                        step=10.0,
+                        hint="Send buffered moves to the controller after this many segments.",
+                    )
+                    self.cfg_display_width = number_field("Display line width", value=1.5, min_value=0.1, max_value=5.0, step=0.1, hint="Preview stroke width on plotting bed.")
+
+                with ui.column().classes("gap-2"):
                     ui.label("Mode").classes("text-[11px] font-medium text-gray-600")
                     self.cfg_z_mode_toggle = ui.toggle(
                         options=["start", "centroid", "per_segment", "threshold"],
-                        value="per_segment",
+                        value="centroid",
                     ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
                     self.cfg_z_threshold = number_field(
                         "Z threshold",
-                        value=0.02,
+                        value=0.10,
                         min_value=0.0,
-                        max_value=1000.0,
+                        max_value=1.0,
                         step=0.01,
                         hint="Only used with the 'threshold' z-mode.",
                     )
 
                 with ui.column().classes("gap-2"):
                     ui.label("Pen Motion").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_default_pen_pressure = number_field("Default pen pressure", value=-0.1, min_value=-1.0, max_value=1.0, step=0.01)
                     self.cfg_lift_delta = number_field("Lift delta", value=0.4, min_value=0.0, max_value=1.0, step=0.01)
                     self.cfg_settle_down = number_field("Settle down (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
                     self.cfg_settle_up = number_field("Settle up (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
@@ -1449,14 +1473,6 @@ class PlotterApp:
                             min=0.0,
                             step=0.1,
                         ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
-
-                with ui.column().classes("gap-2"):
-                    ui.label("Miscellaneous").classes("text-[11px] font-medium text-gray-600")
-                    self.cfg_flush_every = number_field("Flush every (cmds)", value=200.0, min_value=1.0, step=10.0)
-                    self.cfg_travel_feed = number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
-                    self.cfg_default_feed_draw = number_field("Default draw feed (mm/min)", value=4000.0, min_value=1.0, step=100.0)
-                    self.cfg_default_pen_pressure = number_field("Default pen pressure", value=-0.1, min_value=-1.0, max_value=1.0, step=0.01)
-
     def _build_run_tab(self) -> None:
         with ui.card().classes("p-2 gap-3"):
             ui.label("Preview & Run").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
@@ -1658,6 +1674,17 @@ class PlotterApp:
             'return_home': True,
         }
 
+    def _on_display_width_change(self, e: events.ValueChangeEventArguments) -> None:
+        try:
+            value = float(e.value)
+        except (TypeError, ValueError):
+            return
+        value = max(0.1, min(5.0, value))
+        if abs(self.pattern_display_width - value) < 1e-6:
+            return
+        self.pattern_display_width = value
+        self._update_canvas()
+
     def _clone_pattern_for_run(self, default_feed: Optional[int], default_pen_pressure: float) -> Pattern:
         clone = Pattern()
         for item in self.pattern.items:
@@ -1857,11 +1884,22 @@ class PlotterApp:
             ui.label("Script Input").classes("text-[12px] font-medium text-gray-700")
             self.pattern_script_area = ui.textarea(
                 placeholder="Enter pattern script…",
-            ).props("autogrow rows=6 dense")
+            ).props("autogrow rows=6 dense").classes("w-full")
             ui.label(
                 "Commands: LINE x1 y1 x2 y2, POLYLINE x1 y1 x2 y2 ..., CIRCLE cx cy radius "
                 "(optional start_deg sweep_deg). Extra options: pen=<id> pressure=<float> feed=<mm/min>."
             ).classes("text-[10px] text-gray-500 leading-tight")
+
+        with ui.card().classes("p-2 gap-3 w-full"):
+            ui.label("Display").classes("text-[12px] font-medium text-gray-700")
+            self.display_width_slider = ui.slider(
+                min=0.1,
+                max=5.0,
+                step=0.1,
+                value=self.pattern_display_width,
+                on_change=self._on_display_width_change,
+            ).props("dense").classes("w-full")
+            ui.label("Adjusts stroke width in the preview only.").classes("text-[10px] text-gray-500")
 
         with ui.card().classes("p-2 gap-3 w-full"):
             ui.label("Transform Pattern").classes(
@@ -1885,6 +1923,22 @@ class PlotterApp:
                         ui.button(
                             label,
                             on_click=lambda p=pct: self._scale_pattern(p),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom X (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern_x(p),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom Y (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern_y(p),
                         ).props("outline size='xs' dense").classes(button_classes)
                 ui.label("Shift X (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
                 with ui.row().classes(row_classes):
@@ -1911,6 +1965,20 @@ class PlotterApp:
                     ui.button(
                         "Y",
                         on_click=lambda: self._flip_pattern("y"),
+                    ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Fit").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    ui.button(
+                        "Center",
+                        on_click=self._center_pattern,
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Scale W",
+                        on_click=self._scale_pattern_to_width,
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Scale H",
+                        on_click=self._scale_pattern_to_height,
                     ).props("outline size='xs' dense").classes(button_classes)
 
     async def _handle_svg_upload(self, event: events.UploadEventArguments) -> None:
@@ -2147,21 +2215,43 @@ class PlotterApp:
         self._log_status(f"Rotated pattern by {degrees:+.1f}°.")
 
     def _scale_pattern(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center(factor):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_x(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center_axes(factor, 1.0):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern width {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_y(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center_axes(1.0, factor):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern height {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_about_center(self, factor: float) -> bool:
+        return self._scale_pattern_about_center_axes(factor, factor)
+
+    def _scale_pattern_about_center_axes(self, factor_x: float, factor_y: float) -> bool:
         if not self.pattern.items:
             ui.notify("No pattern loaded.", color="warning")
-            return
-        factor = 1.0 + percent / 100.0
-        if factor <= 0.01:
-            ui.notify("Scale too small; choose a larger value.", color="warning")
-            return
+            return False
+        if factor_x <= 0.01 or factor_y <= 0.01:
+            ui.notify("Scale factor too small; choose a larger value.", color="warning")
+            return False
         cx, cy = self._pattern_center()
 
         def transform(x: float, y: float) -> Tuple[float, float]:
-            return (cx + (x - cx) * factor, cy + (y - cy) * factor)
+            return (cx + (x - cx) * factor_x, cy + (y - cy) * factor_y)
 
         self._apply_pattern_transform(transform)
-        change = "larger" if percent >= 0 else "smaller"
-        self._log_status(f"Scaled pattern {change} by {percent:+.0f}%.")
+        return True
 
     def _translate_pattern(self, dx: float, dy: float) -> None:
         if not self.pattern.items:
@@ -2191,6 +2281,85 @@ class PlotterApp:
         self._apply_pattern_transform(transform)
         axis_name = "X-axis" if axis == "x" else "Y-axis"
         self._log_status(f"Flipped pattern across {axis_name}.")
+
+    def _center_pattern(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to center.", color="warning")
+            return
+        area_min_x, area_min_y = self.state.rect_min
+        area_max_x, area_max_y = self.state.rect_max
+        area_center_x = (area_min_x + area_max_x) / 2.0
+        area_center_y = (area_min_y + area_max_y) / 2.0
+        pattern_center_x, pattern_center_y = self._pattern_center()
+        dx = area_center_x - pattern_center_x
+        dy = area_center_y - pattern_center_y
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            self._log_status("Pattern already centered in selected area.")
+            return
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (x + dx, y + dy)
+
+        self._apply_pattern_transform(transform)
+        self._log_status("Centered pattern in selected area.")
+
+    def _scale_pattern_to_width(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to scale.", color="warning")
+            return
+        min_x, _, max_x, _ = bounds
+        pattern_width = max_x - min_x
+        if pattern_width <= 1e-6:
+            ui.notify("Pattern width is zero; cannot scale.", color="warning")
+            return
+        area_min_x, _ = self.state.rect_min
+        area_max_x, _ = self.state.rect_max
+        area_width = area_max_x - area_min_x
+        if area_width <= 1e-6:
+            ui.notify("Work area width is zero; adjust the selection first.", color="warning")
+            return
+        factor = area_width / pattern_width
+        if abs(factor - 1.0) < 1e-6:
+            self._log_status("Pattern already matches work area width.")
+            return
+        if not self._scale_pattern_about_center(factor):
+            return
+        self._log_status(f"Scaled pattern to selected width ({area_width:.1f} mm).")
+
+    def _scale_pattern_to_height(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to scale.", color="warning")
+            return
+        _, min_y, _, max_y = bounds
+        pattern_height = max_y - min_y
+        if pattern_height <= 1e-6:
+            ui.notify("Pattern height is zero; cannot scale.", color="warning")
+            return
+        _, area_min_y = self.state.rect_min
+        _, area_max_y = self.state.rect_max
+        area_height = area_max_y - area_min_y
+        if area_height <= 1e-6:
+            ui.notify("Work area height is zero; adjust the selection first.", color="warning")
+            return
+        factor = area_height / pattern_height
+        if abs(factor - 1.0) < 1e-6:
+            self._log_status("Pattern already matches work area height.")
+            return
+        if not self._scale_pattern_about_center(factor):
+            return
+        self._log_status(f"Scaled pattern to selected height ({area_height:.1f} mm).")
 
     def _parse_pattern_script(self, script_text: str) -> Pattern:
         pattern = Pattern()
@@ -2270,13 +2439,85 @@ class PlotterApp:
 
         pattern = Pattern()
 
+        style_classes: Dict[str, Dict[str, str]] = {}
+
+        def parse_style_text(text: str) -> None:
+            for cls, body in re.findall(r"\.([A-Za-z0-9_-]+)\s*\{([^}]*)\}", text or "", flags=re.MULTILINE):
+                props: Dict[str, str] = {}
+                for decl in body.split(';'):
+                    if ':' not in decl:
+                        continue
+                    key, val = decl.split(':', 1)
+                    props[key.strip().lower()] = val.strip()
+                if props:
+                    style_classes[cls] = props
+
+        for style_elem in root.findall('.//{http://www.w3.org/2000/svg}style'):
+            parse_style_text(style_elem.text or "")
+
+        color_to_pen: Dict[str, int] = {}
+
+        def normalize_color(color: str) -> str:
+            return color.strip().lower()
+
+        def pen_id_for_color(color: Optional[str]) -> Optional[int]:
+            color_norm = normalize_color(color or '')
+            if color_norm in {"none", "transparent"}:
+                return None
+            if color_norm == "":
+                color_norm = "#000000"
+            if color_norm not in color_to_pen:
+                color_to_pen[color_norm] = len(color_to_pen)
+            return color_to_pen[color_norm]
+
+        def parse_style_attr(style_value: str) -> Dict[str, str]:
+            result: Dict[str, str] = {}
+            for decl in style_value.split(';'):
+                if ':' not in decl:
+                    continue
+                key, val = decl.split(':', 1)
+                result[key.strip().lower()] = val.strip()
+            return result
+
+        def resolve_styles(element: ET.Element) -> Dict[str, str]:
+            styles: Dict[str, str] = {}
+            class_attr = element.get('class', '')
+            if class_attr:
+                for cls in class_attr.split():
+                    props = style_classes.get(cls)
+                    if props:
+                        styles.update(props)
+            inline_style = element.get('style')
+            if inline_style:
+                styles.update(parse_style_attr(inline_style))
+            for attr in ('stroke', 'fill', 'stroke-width'):
+                if attr in element.attrib:
+                    styles[attr] = element.attrib[attr]
+            return styles
+
         def traverse(element: ET.Element, transform: Tuple[float, float, float, float, float, float]) -> None:
             current_transform = transform
             if "transform" in element.attrib:
                 extra = self._parse_svg_transform(element.attrib["transform"])
                 current_transform = self._combine_transform(transform, extra)
 
+            styles = resolve_styles(element)
+            stroke = styles.get("stroke")
+            fill = styles.get("fill")
+
+            stroke_norm = normalize_color(stroke or "")
+            if stroke_norm in {"", "none", "transparent"}:
+                chosen_color = fill
+            else:
+                chosen_color = stroke
+
+            pen_id = pen_id_for_color(chosen_color)
+
             tag = self._svg_tag_name(element.tag)
+
+            def should_skip() -> bool:
+                return pen_id is None
+
             if tag == "line":
                 try:
                     x1 = float(element.get("x1", "0"))
@@ -2285,25 +2526,26 @@ class PlotterApp:
                     y2 = float(element.get("y2", "0"))
                 except ValueError as exc:
                     raise ValueError(f"Invalid line coordinates in SVG: {exc}") from exc
-                p0 = self._apply_transform(current_transform, x1, y1)
-                p1 = self._apply_transform(current_transform, x2, y2)
-                pattern.add(Line(p0=p0, p1=p1))
+                if not should_skip():
+                    p0 = self._apply_transform(current_transform, x1, y1)
+                    p1 = self._apply_transform(current_transform, x2, y2)
+                    pattern.add(Polyline(pts=[p0, p1], pen_id=pen_id))
             elif tag in {"polyline", "polygon"}:
                 points_attr = element.get("points", "")
                 points = self._parse_svg_points(points_attr)
                 if tag == "polygon" and points and points[0] != points[-1]:
                     points.append(points[0])
                 transformed = [self._apply_transform(current_transform, x, y) for x, y in points]
-                if len(transformed) >= 2:
-                    pattern.add(Polyline(pts=transformed))
+                if len(transformed) >= 2 and not should_skip():
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
             elif tag == "path":
                 d_attr = element.get("d", "")
                 if d_attr:
                     subpaths = self._parse_svg_path(d_attr)
                     for subpath in subpaths:
                         transformed = [self._apply_transform(current_transform, x, y) for x, y in subpath]
-                        if len(transformed) >= 2:
-                            pattern.add(Polyline(pts=transformed))
+                        if len(transformed) >= 2 and not self._is_rectangle_path(transformed) and not should_skip():
+                            pattern.add(Polyline(pts=transformed, pen_id=pen_id))
             elif tag == "circle":
                 try:
                     cx = float(element.get("cx", "0"))
@@ -2311,10 +2553,11 @@ class PlotterApp:
                     r = float(element.get("r", "0"))
                 except ValueError as exc:
                     raise ValueError(f"Invalid circle in SVG: {exc}") from exc
-                base_circle = Circle(c=(cx, cy), r=r)
-                poly = base_circle.to_polyline()
-                transformed = [self._apply_transform(current_transform, x, y) for x, y in poly.pts]
-                pattern.add(Polyline(pts=transformed))
+                if not should_skip():
+                    base_circle = Circle(c=(cx, cy), r=r)
+                    poly = base_circle.to_polyline()
+                    transformed = [self._apply_transform(current_transform, x, y) for x, y in poly.pts]
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
             elif tag == "ellipse":
                 try:
                     cx = float(element.get("cx", "0"))
@@ -2323,14 +2566,15 @@ class PlotterApp:
                     ry = float(element.get("ry", "0"))
                 except ValueError as exc:
                     raise ValueError(f"Invalid ellipse in SVG: {exc}") from exc
-                segments = 64
-                transformed = []
-                for k in range(segments + 1):
-                    theta = 2 * math.pi * k / segments
-                    x = cx + rx * math.cos(theta)
-                    y = cy + ry * math.sin(theta)
-                    transformed.append(self._apply_transform(current_transform, x, y))
-                pattern.add(Polyline(pts=transformed))
+                if not should_skip():
+                    segments = 64
+                    transformed = []
+                    for k in range(segments + 1):
+                        theta = 2 * math.pi * k / segments
+                        x = cx + rx * math.cos(theta)
+                        y = cy + ry * math.sin(theta)
+                        transformed.append(self._apply_transform(current_transform, x, y))
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
 
             for child in element:
                 traverse(child, current_transform)
@@ -2595,6 +2839,27 @@ class PlotterApp:
             subpaths.append(current_path)
 
         return subpaths
+
+    def _is_rectangle_path(self, points: List[Tuple[float, float]], *, tolerance: float = 1e-3) -> bool:
+        if len(points) < 4:
+            return False
+        if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) <= tolerance:
+            pts = points[:-1]
+        else:
+            pts = points
+        if len(pts) != 4:
+            return False
+        xs = {round(p[0], 3) for p in pts}
+        ys = {round(p[1], 3) for p in pts}
+        if len(xs) != 2 or len(ys) != 2:
+            return False
+        # Check each edge is axis-aligned
+        for a, b in zip(pts, pts[1:] + pts[:1]):
+            dx = abs(a[0] - b[0])
+            dy = abs(a[1] - b[1])
+            if not ((dx <= tolerance and dy > tolerance) or (dy <= tolerance and dx > tolerance)):
+                return False
+        return True
 
     def _identity_transform(self) -> Tuple[float, float, float, float, float, float]:
         return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
