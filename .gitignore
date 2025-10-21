@@ -1,1 +1,5 @@
 stefanNina.png
+.matplotlib_cache/
+__pycache__/
+.github/
+.DS_Store
