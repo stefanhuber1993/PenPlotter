@@ -12,11 +12,25 @@ from __future__ import annotations
 import argparse
 import os
 import math
+import asyncio
 from pathlib import Path
+from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+
+import re
+import xml.etree.ElementTree as ET
 
 from nicegui import events, ui
+
+from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS, Renderer, RendererCancelled
+from penplot_helper import Config, GRBL, Compensation, Rect
+
+try:
+    from serial.tools import list_ports
+except Exception:  # pragma: no cover - optional dependency safeguard
+    list_ports = None  # type: ignore
+
 
 DEFAULT_BED_SIZE: Tuple[float, float] = (300.0, 245.0)
 DEFAULT_RECT_SIZE: Tuple[float, float] = (300.0, 245.0)
@@ -37,7 +51,6 @@ class Pot:
 class PlotterState:
     """Aggregates all mutable UI state for the mock implementation."""
 
-    workpiece: str = "A4"
     z_height: float = 1.0
     status_lines: List[str] = field(default_factory=lambda: ["Ready. Configure the plotter to begin."])
     pots: List[Pot] = field(default_factory=list)
@@ -76,19 +89,60 @@ class PlotterApp:
         self.status_log = None
         self.pot_select = None
         self.progress = None
+        self.pattern_display_width = 1.5
         self.progress_label = None
-        self.workpiece_select = None
         self.color_picker = None
         self.canvas = None
         self.canvas_element = None
         self.canvas_size = (700, 600)
-        self.canvas_margin = 44
+        self.canvas_margin = 32
         self._last_pointer_pos: Optional[Tuple[float, float]] = None
         self.z_slider = None
         self._suppress_height_event = False
         self._suppress_color_event = False
         self.area_label = None
         self._suppress_pot_event = False
+        self.show_area_overlay = True
+        self.show_pattern_overlay = True
+        self.show_pots_overlay = True
+        self.area_toggle = None
+        self.pattern_toggle = None
+        self.pots_toggle = None
+        self.status_summary = None
+        self.status_summary_label = None
+        self.recent_status_container = None
+        self.pattern = Pattern()
+        self.pattern_name: str = "Empty"
+        self.pattern_summary_label = None
+        self.pattern_script_area = None
+        self.pattern_has_data = False
+        self.pen_filter_select = None
+        self.preview_pen_choice: str = "all"
+        self.serial_select = None
+        self.connect_button = None
+        self.disconnect_button = None
+        self.comms_status_label = None
+        self.comms_output = None
+        self.gcode_input = None
+        self.comms_log_lines: List[str] = []
+        self.grbl: Optional[GRBL] = None
+        self.grbl_config = Config()
+        if serial_device:
+            self.grbl_config.port = serial_device
+        self._is_connecting = False
+        self.serial_port_map: Dict[str, str] = {}
+        self._grbl_lock = asyncio.Lock()
+        self._pending_move_target: Optional[Tuple[float, float]] = None
+        self._pending_move_task: Optional[asyncio.Task] = None
+        self._pending_pen_value: Optional[float] = None
+        self._pending_pen_task: Optional[asyncio.Task] = None
+        self._active_pen_height: float = 1.0
+        self.renderer: Optional[Renderer] = None
+        self.run_task: Optional[asyncio.Task] = None
+        self.run_paused: bool = False
+        self.run_start_button = None
+        self.run_pause_button = None
+        self.run_stop_button = None
         self._apply_bed_size(bed_size)
         self._initialize_default_rectangle()
         if serial_device:
@@ -98,6 +152,28 @@ class PlotterApp:
         button = ui.button(label, on_click=on_click, color=color)
         button.props("unelevated dense size='sm'")
         button.classes("px-2 py-1 text-xs")
+        return button
+
+    def _apply_toggle_style(self, button: ui.button, active: bool) -> None:
+        """Apply strong visual contrast between active and inactive states."""
+        if active:
+            button.classes(remove="toggle-btn-inactive", add="toggle-btn-active")
+            button.props(remove="outline", add="unelevated")
+            button.style(
+                "transform: scale(1.04); box-shadow: 0 2px 10px rgba(0,0,0,0.20);"
+            )
+        else:
+            button.classes(remove="toggle-btn-active", add="toggle-btn-inactive")
+            button.props(remove="unelevated", add="outline")
+            button.style("transform: scale(1.0); box-shadow: none;")
+
+    def _toggle_button(self, label: str, handler, state: bool) -> ui.button:
+        """Create a small toggleable button and style it via _apply_toggle_style."""
+        button = ui.button(label, on_click=handler).props("size='sm'")
+        button.classes(
+            "px-3 py-1.5 text-sm font-medium rounded-md border transition-all duration-200 ease-in-out"
+        )
+        self._apply_toggle_style(button, state)
         return button
 
     def _apply_bed_size(self, bed_size: Tuple[float, float]) -> None:
@@ -122,6 +198,32 @@ class PlotterApp:
             f"Initial work area set to {rect_width:.0f} × {rect_height:.0f} mm within bed "
             f"{self.state.bed_width:.0f} × {self.state.bed_height:.0f} mm."
         )
+
+    def _toggle_area(self) -> None:
+        self.show_area_overlay = not self.show_area_overlay
+        self._apply_toggle_style(self.area_toggle, self.show_area_overlay)
+        if not self.show_area_overlay:
+            if self.state.selected_entity and self.state.selected_entity[0] == "corner":
+                self.state.selected_entity = None
+            self._update_selection_label()
+        else:
+            self._select_entity(("corner", "BL"))
+        self._update_canvas()
+
+    def _toggle_pattern(self) -> None:
+        self.show_pattern_overlay = not self.show_pattern_overlay
+        self._apply_toggle_style(self.pattern_toggle, self.show_pattern_overlay)
+        self._update_canvas()
+
+    def _toggle_pots(self) -> None:
+        self.show_pots_overlay = not self.show_pots_overlay
+        self._apply_toggle_style(self.pots_toggle, self.show_pots_overlay)
+        if not self.show_pots_overlay:
+            self.state.selected_pot_id = None
+            if self.state.selected_entity and self.state.selected_entity[0] == "pot":
+                self.state.selected_entity = None
+            self._update_selection_label()
+        self._update_canvas()
 
     def _normalize_entity(
         self, entity: Optional[Tuple[str, Union[str, int]]]
@@ -160,23 +262,19 @@ class PlotterApp:
                     ui.label(f"Device: {self.state.serial_device}").classes(
                         "text-xs font-medium px-2 py-0.5 bg-white text-primary rounded"
                     )
-            self.workpiece_select = ui.select(
-                ["A4", "A5", "15 cm", "10 cm"],
-                value=self.state.workpiece,
-                on_change=self._on_workpiece_change,
-            ).props("label='Workpiece' dense")
 
-        with ui.column().classes("w-full max-w-screen-lg mx-auto p-4 gap-4"):
-            ui.label("Area setup, Z compensation, color pots, overlay preview, and run controls.").classes(
-                "text-sm text-gray-600"
-            )
-            with ui.row().classes("w-full items-start gap-4"):
-                self._build_canvas_section()
-                self._build_height_and_actions()
-            with ui.row().classes("w-full items-start gap-4"):
-                self._build_pot_controls()
-                self._build_runner_panel()
-            self._build_status_area()
+        with ui.column().classes("w-full mx-auto p-3 gap-3"):
+            with ui.row().classes("w-full gap-3 items-stretch").style(
+                "min-height: calc(100vh - 120px); flex-wrap: nowrap; width: 100%;"
+            ):
+                with ui.column().classes("gap-3 h-full").style(
+                    "flex: 1 1 auto; min-width: 360px; width: auto;"
+                ):
+                    self._build_canvas_section()
+                with ui.column().classes("h-full w-full gap-2").style(
+                    "flex: 0 0 250px; width: 400px; max-width: 400px; min-width: 400px;"
+                ):
+                    self._build_control_tabs()
         if self.state.selected_entity:
             self._select_entity(self.state.selected_entity)
         else:
@@ -186,28 +284,489 @@ class PlotterApp:
     # Canvas and overlay mock
     # ------------------------------------------------------------------
     def _build_canvas_section(self) -> None:
-        with ui.card().classes("flex-1 min-w-[340px] p-3 gap-3"):
-            with ui.row().classes("gap-2 flex-wrap items-center"):
-                ui.label("Plotting bed").classes("text-sm font-medium")
-                self.area_label = ui.label("").classes("text-xs text-gray-500")
-            with ui.row().classes("gap-2 flex-wrap items-center"):
-                self._compact_button("Sweep", lambda: self._notify("Swept rectangle."), color="primary")
-                self._compact_button("Pen Up", lambda: self._notify("Moved pen up."))
-                self._compact_button("Pen Down", lambda: self._notify("Moved pen down."))
-                self._compact_button("Home", lambda: self._notify("Homed axes."))
+        with ui.card().classes("flex-1 min-w-[340px] p-2 gap-2"):
+            with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
+                ui.label("Plotting bed").classes("text-[11px] font-medium")
+                self.area_label = ui.label("").classes("text-[10px] text-gray-500")
+            with ui.row().classes("gap-1 flex-wrap items-center text-[11px]"):
+                ui.label("Jog & Controls").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                self._compact_button("Home", lambda: self._spawn(self._home_axes()))
+                self._compact_button("Pen Up", lambda: self._spawn(self._pen_button_action(1.0)))
+                self._compact_button("Pen Down", lambda: self._spawn(self._pen_button_action(0.0)))
+                self.area_toggle = self._toggle_button("Area", self._toggle_area, self.show_area_overlay)
+                self.pattern_toggle = self._toggle_button("Pattern", self._toggle_pattern, self.show_pattern_overlay)
+                self.pots_toggle = self._toggle_button("Pots", self._toggle_pots, self.show_pots_overlay)
             self.canvas = ui.html(
                 content=self._render_canvas(),
                 sanitize=False,
-            ).classes("rounded-lg border bg-slate-50").style(
-                f"width:{self.canvas_size[0]}px;height:{self.canvas_size[1]}px;touch-action:none;cursor:crosshair;"
+            ).classes("rounded-lg border bg-slate-50 w-full").style(
+                f"width:100%; aspect-ratio:{self.state.bed_width}/{self.state.bed_height};"
+                "touch-action:none;cursor:crosshair;"
             )
             self.canvas.on("pointerdown", self._handle_canvas_pointer_down)
             self.canvas.on("pointermove", self._handle_canvas_pointer_move)
             self.canvas.on("pointerup", self._handle_canvas_pointer_up)
             self.canvas.on("pointerleave", self._handle_canvas_pointer_up)
-            with ui.row().classes("mt-1 gap-2 text-xs text-gray-500"):
+            with ui.row().classes("mt-1 gap-1 text-[10px] text-gray-500"):
                 ui.icon("touch_app").classes("text-primary")
                 ui.label("Click to jog corners or drag handles to reshape the work area.")
+
+        with ui.column().classes("w-full gap-2"):
+            self.status_summary = ui.card().classes("p-2 bg-slate-100")
+            with self.status_summary:
+                self.status_summary_label = ui.label(
+                    "Connected | COM3 @ 115200 | X=0.0 | Y=0.0 | Z=0.00 | Idle"
+                ).classes("text-[11px] font-medium text-gray-800")
+
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Selection").classes("text-[11px] font-medium text-gray-600")
+                self.selection_label = ui.label("No selection").classes("text-[11px] text-gray-700")
+                ui.separator()
+                ui.label("Recent activity").classes("text-[11px] font-medium text-gray-600")
+                self.recent_status_container = ui.column().classes("gap-1 text-[11px] text-gray-700")
+                self._update_status_panels()
+
+    def _build_control_tabs(self) -> None:
+        with ui.card().classes("w-full h-full p-1"):
+            with ui.tabs().classes("text-[10px] flex gap-2 !px-0 w-full").style(
+                "flex-wrap: wrap; row-gap: 6px;"
+            ) as tabs:
+                tab_comms = ui.tab("Comms").classes("px-2 py-1 text-[10px]")
+                tab_area = ui.tab("Area").classes("px-2 py-1 text-[10px]")
+                tab_pots = ui.tab("Pots").classes("px-2 py-1 text-[10px]")
+                tab_load = ui.tab("Load").classes("px-2 py-1 text-[10px]")
+                tab_config = ui.tab("Config").classes("px-2 py-1 text-[10px]")
+                tab_run = ui.tab("Run").classes("px-2 py-1 text-[10px]")
+            with ui.tab_panels(tabs, value=tab_comms).classes("h-full text-[11px]"):
+                with ui.tab_panel(tab_comms).classes("h-full overflow-y-auto p-2"):
+                    self._build_comms_tab()
+                with ui.tab_panel(tab_area).classes("h-full overflow-y-auto p-2"):
+                    self._build_area_controls()
+                with ui.tab_panel(tab_pots).classes("h-full overflow-y-auto p-2"):
+                    self._build_pot_controls()
+                with ui.tab_panel(tab_load).classes("h-full overflow-y-auto p-2"):
+                    self._build_load_tab()
+                with ui.tab_panel(tab_config).classes("h-full overflow-y-auto p-2"):
+                    self._build_config_tab()
+                with ui.tab_panel(tab_run).classes("h-full overflow-y-auto p-2"):
+                    self._build_run_tab()
+
+    def _build_area_controls(self) -> None:
+        with ui.column().classes("gap-2"):
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Work Area Presets").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                with ui.row().classes("gap-2 flex-wrap text-[11px]"):
+                    self._compact_button("A4", lambda: self._quick_size("A4"))
+                    self._compact_button("A5", lambda: self._quick_size("A5"))
+                    self._compact_button("15 cm", lambda: self._quick_size("15 cm"))
+                    self._compact_button("10 cm", lambda: self._quick_size("10 cm"))
+            with ui.card().classes("p-2 gap-2"):
+                ui.label("Work Area Utilities").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                with ui.row().classes("gap-2 flex-wrap text-[11px]"):
+                    self._compact_button("Sweep Area", lambda: self._spawn(self._sweep_selected_area()))
+                    self._compact_button("Reset Z Heights", self._reset_all_z_heights)
+            with ui.card().classes("p-2 gap-3 items-center"):
+                ui.label("Z Height").classes("text-[10px] uppercase tracking-wide text-gray-500")
+                self.z_slider_container = ui.column().classes("items-center")
+                with self.z_slider_container:
+                    self.z_slider = ui.slider(
+                        min=0.0,
+                        max=1.0,
+                        step=0.01,
+                        value=self.state.z_height,
+                        on_change=self._on_height_change,
+                    ).props("vertical reverse label-always").style("height:240px;width:2.2rem;")
+
+    def _build_comms_tab(self) -> None:
+        with ui.card().classes("p-3 gap-3 w-full"):
+            ui.label("Serial Link").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
+            with ui.row().classes("gap-2 items-center flex-wrap"):
+                self.serial_select = ui.select(
+                    options=[],
+                    value=None,
+                    with_input=False,
+                ).props("label='Serial device' dense").classes("min-w-[220px] text-[11px]")
+                ui.button("Refresh", on_click=self._refresh_serial_ports).props("size='sm' outline").classes(
+                    "text-[11px]"
+                )
+            with ui.row().classes("gap-2 flex-wrap"):
+                self.connect_button = ui.button(
+                    "Connect",
+                    color="positive",
+                    on_click=self._connect_to_plotter,
+                ).props("unelevated size='sm'")
+                self.disconnect_button = ui.button(
+                    "Disconnect",
+                    color="negative",
+                    on_click=self._disconnect_plotter,
+                ).props("outline size='sm'")
+            self.comms_status_label = ui.label("Disconnected").classes(
+                "text-[11px] font-mono text-gray-400"
+            )
+
+            ui.separator()
+            ui.label("Terminal").classes("text-[11px] font-medium text-gray-600")
+            self.comms_output = ui.code("", language="text").classes(
+                "w-full max-w-[360px] mx-auto bg-gray-900 text-green-300 text-[11px] font-mono rounded-lg p-3 "
+                "shadow-inner min-h-[200px] max-h-[260px] overflow-y-auto overflow-x-auto"
+            ).style("width: 100%; box-sizing: border-box; white-space: pre-wrap; word-break: break-word;")
+
+            ui.separator()
+            ui.label("Send G-code").classes("text-[11px] font-medium text-gray-600")
+            self.gcode_input = ui.textarea(
+                placeholder="Enter G-code commands..."
+            ).props("autogrow rows=3 dense").classes("font-mono text-[12px]")
+            with ui.row().classes("gap-2 justify-end"):
+                ui.button("Send", color="primary", on_click=self._send_gcode_command).props("unelevated size='sm'")
+                ui.button("Clear Log", on_click=self._clear_comms_log).props("size='sm'")
+
+        self._refresh_serial_ports()
+        self._update_comms_log_display()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    def _refresh_serial_ports(self) -> None:
+        if self.serial_select is None:
+            return
+        ports: List[Any] = []
+        if list_ports is not None:
+            try:
+                ports = list(list_ports.comports())
+            except Exception as exc:  # pragma: no cover
+                self._append_comms_log(f"[error] Unable to enumerate serial ports: {exc}")
+        old_map = dict(self.serial_port_map)
+        self.serial_port_map = {}
+        label_by_device: Dict[str, str] = {}
+        option_labels: List[str] = []
+        for port in ports:
+            device = getattr(port, "device", None) or getattr(port, "name", "")
+            description = getattr(port, "description", "") or ""
+            label = device
+            if description and description != device:
+                label = f"{device} — {description}"
+            label = str(label)
+            device_value = str(device)
+            self.serial_port_map[label] = device_value
+            self.serial_port_map[device_value] = device_value
+            label_by_device[device_value] = label
+            option_labels.append(label)
+        previous_label = self.serial_select.value
+        previous_device = old_map.get(previous_label, previous_label) if previous_label else None
+        self.serial_select.options = option_labels
+        preferred = None
+        if self.grbl and self.grbl.ser and getattr(self.grbl.ser, "port", None):
+            preferred = self.grbl.ser.port
+        elif getattr(self.grbl_config, "port", None):
+            preferred = self.grbl_config.port
+        new_device = None
+        if option_labels:
+            valid_devices = set(label_by_device.keys())
+            if preferred in valid_devices:
+                new_device = preferred
+            elif previous_device in valid_devices:
+                new_device = previous_device
+            else:
+                new_device = next(iter(valid_devices))
+        if new_device:
+            display_label = label_by_device.get(new_device)
+        else:
+            display_label = None
+        self.serial_select.value = display_label
+        self.serial_select.update()
+        self._update_comms_buttons()
+        self._schedule_comms_scroll()
+
+    def _update_comms_status(self, *, message: Optional[str] = None) -> None:
+        if self.comms_status_label is None:
+            return
+        if message is not None:
+            self.comms_status_label.set_text(message)
+            return
+        if self._is_connecting:
+            status_text = "Connecting..."
+        elif self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False):
+            status_text = f"Connected to {self.grbl.cfg.port} @ {self.grbl.cfg.baudrate}"
+        else:
+            status_text = "Disconnected"
+        self.comms_status_label.set_text(status_text)
+
+    def _update_comms_buttons(self) -> None:
+        connected = bool(self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False))
+        if self.connect_button is not None:
+            if connected or self._is_connecting:
+                self.connect_button.disable()
+            else:
+                self.connect_button.enable()
+        if self.disconnect_button is not None:
+            if connected and not self._is_connecting:
+                self.disconnect_button.enable()
+            else:
+                self.disconnect_button.disable()
+
+    def _update_comms_log_display(self) -> None:
+        if self.comms_output is None:
+            return
+        content = "\n".join(self.comms_log_lines)
+        self.comms_output.set_content(content)
+        self._schedule_comms_scroll()
+
+    def _schedule_comms_scroll(self) -> None:
+        if self.comms_output is None:
+            return
+
+        async def _scroll() -> None:
+            await asyncio.sleep(0.05)
+            element_id = self.comms_output.id
+            script = (
+                f"""
+                (function() {{
+                    const wrap = document.getElementById('{element_id}');
+                    if (!wrap) return;
+                    wrap.scrollTop = wrap.scrollHeight;
+                }})();
+                """
+            )
+            try:
+                await ui.run_javascript(script)
+            except Exception:
+                pass
+
+        asyncio.create_task(_scroll())
+
+    def _append_comms_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.comms_log_lines.append(f"[{timestamp}] {message}")
+        if len(self.comms_log_lines) > 400:
+            self.comms_log_lines = self.comms_log_lines[-400:]
+        self._update_comms_log_display()
+
+    def _clear_comms_log(self) -> None:
+        self.comms_log_lines.clear()
+        self._update_comms_log_display()
+        self._append_comms_log("Log cleared.")
+
+    def _is_grbl_ready(self) -> bool:
+        return bool(self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False))
+
+    def _require_grbl(self, *, alert: bool = True) -> Optional[GRBL]:
+        if self._is_grbl_ready():
+            return self.grbl
+        if alert:
+            try:
+                ui.notify("Connect to the plotter first.", color="warning")
+            except RuntimeError:
+                pass
+        return None
+
+    async def _execute_grbl(self, description: str, worker: Callable[[GRBL], Any], *, alert: bool = True) -> Optional[Any]:
+        grbl = self._require_grbl(alert=alert)
+        if not grbl:
+            return None
+        async with self._grbl_lock:
+            self._append_comms_log(description)
+            try:
+                result = await asyncio.to_thread(worker, grbl)
+            except Exception as exc:
+                error_text = f"{description} failed: {exc}"
+                self._append_comms_log(f"[error] {error_text}")
+                if alert:
+                    try:
+                        ui.notify(error_text, color="negative")
+                    except RuntimeError:
+                        pass
+                return None
+            else:
+                return result
+
+    def _spawn(self, coro: Awaitable[Any]) -> None:
+        asyncio.create_task(coro)
+
+    def _enter_safe_pen_mode(self) -> None:
+        current = self._pending_pen_value if self._pending_pen_value is not None else self._active_pen_height
+        if current is None or current < 0.99:
+            self._schedule_pen_height(1.0)
+
+    def _schedule_position_move(self, x: float, y: float, *, alert: bool = False, safe: bool = True) -> None:
+        if safe:
+            self._enter_safe_pen_mode()
+        if not self._require_grbl(alert=alert):
+            return
+        self._pending_move_target = (float(x), float(y))
+        if self._pending_move_task is None:
+            self._pending_move_task = asyncio.create_task(self._flush_pending_move())
+
+    async def _flush_pending_move(self) -> None:
+        try:
+            while True:
+                target = self._pending_move_target
+                await asyncio.sleep(0.024)
+                if target == self._pending_move_target and target is not None:
+                    await self._move_to_position(*target)
+                    self._pending_move_target = None
+                    return
+        finally:
+            self._pending_move_task = None
+
+    async def _move_to_position(self, x: float, y: float) -> None:
+        await self._execute_grbl(
+            f"Move to ({x:.1f}, {y:.1f})",
+            lambda g: g.move_xy(x=x, y=y, wait=True),
+            alert=False,
+        )
+
+    def _schedule_pen_height(self, pos: float) -> None:
+        if not self._require_grbl(alert=False):
+            return
+        self._pending_pen_value = float(max(0.0, min(1.0, pos)))
+        if self._pending_pen_task is None:
+            self._pending_pen_task = asyncio.create_task(self._flush_pending_pen())
+
+    async def _flush_pending_pen(self) -> None:
+        try:
+            while True:
+                value = self._pending_pen_value
+                await asyncio.sleep(0.016)
+                if value == self._pending_pen_value and value is not None:
+                    await self._set_pen_height(value)
+                    self._pending_pen_value = value
+                    return
+        finally:
+            self._pending_pen_task = None
+
+    async def _set_pen_height(self, pos: float, *, alert: bool = False) -> None:
+        await self._execute_grbl(
+            f"Set pen height to {pos:.2f}",
+            lambda g: g.pen_set(pos, step=0.05, step_delay_s=0.02, wait=False),
+            alert=alert,
+        )
+        self._active_pen_height = float(max(0.0, min(1.0, pos)))
+
+    async def _pen_button_action(self, target: float) -> None:
+        if not self._require_grbl(alert=True):
+            return
+        target = float(max(0.0, min(1.0, target)))
+        await self._set_pen_height(target, alert=False)
+        self._log_status(f"Pen moved to {target:.2f} height.")
+
+    async def _home_axes(self) -> None:
+        if not self._require_grbl(alert=True):
+            return
+        await self._set_pen_height(1.0, alert=False)
+        result = await self._execute_grbl("Move to origin", lambda g: g.move_xy(x=0.0, y=0.0, wait=True))
+        if result is not None:
+            self._log_status("Moved to origin (0,0) with pen up.")
+
+    async def _sweep_work_area(self) -> None:
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        width = max(0.0, max_x - min_x)
+        height = max(0.0, max_y - min_y)
+        if width <= 0.0 or height <= 0.0:
+            ui.notify("Define a valid work area before sweeping.", color="warning")
+            return
+        desc = f"Sweeping work area {width:.1f} × {height:.1f} mm"
+        result = await self._execute_grbl(desc, lambda g: g.sweep_rect(width, height, min_x, min_y))
+        if result is not None:
+            self._log_status(
+                f"Swept work area from ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})."
+            )
+
+    async def _sweep_selected_area(self) -> None:
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        width = max(0.0, max_x - min_x)
+        height = max(0.0, max_y - min_y)
+        if width <= 0.0 or height <= 0.0:
+            ui.notify("Define a valid work area before sweeping.", color="warning")
+            return
+        desc = f"Sweeping selected area {width:.1f} × {height:.1f} mm"
+        result = await self._execute_grbl(desc, lambda g: g.sweep_rect(width, height, min_x, min_y))
+        if result is not None:
+            self._log_status(
+                f"Swept selected area from ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})."
+            )
+
+    def _connect_grbl_sync(self, port: str) -> GRBL:
+        cfg_data = vars(self.grbl_config).copy()
+        cfg_data["port"] = port
+        cfg = Config(**cfg_data)
+        grbl = GRBL(cfg).connect()
+        return grbl
+
+    async def _connect_to_plotter(self) -> None:
+        if self._is_connecting:
+            return
+        if self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False):
+            ui.notify("Plotter is already connected.", color="info")
+            return
+        port_label = self.serial_select.value if self.serial_select else None
+        port = self.serial_port_map.get(port_label, port_label)
+        if not port:
+            ui.notify("Select a serial device first.", color="warning")
+            return
+        self._is_connecting = True
+        self._update_comms_buttons()
+        self._update_comms_status(message=f"Connecting to {port} ...")
+        self._append_comms_log(f"Connecting to {port} ...")
+        try:
+            grbl = await asyncio.to_thread(self._connect_grbl_sync, port)
+        except Exception as exc:
+            self._is_connecting = False
+            error_text = f"Failed to connect: {exc}"
+            self._append_comms_log(f"[error] {error_text}")
+            self._update_comms_status(message="Connection failed.")
+            self._update_comms_buttons()
+            ui.notify(error_text, color="negative")
+            return
+        self.grbl = grbl
+        self.grbl_config = grbl.cfg
+        self._is_connecting = False
+        self._sync_grbl_compensation()
+        success_text = f"Connected to {grbl.cfg.port} @ {grbl.cfg.baudrate}"
+        self._append_comms_log(success_text)
+        ui.notify(f"Connected to {grbl.cfg.port}", color="positive")
+        self._refresh_serial_ports()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    async def _disconnect_plotter(self, *, silent: bool = False) -> None:
+        if not self.grbl:
+            if not silent:
+                ui.notify("No active connection.", color="warning")
+            return
+        grbl = self.grbl
+        await self._execute_grbl("Move to origin before disconnect", lambda g: g.move_xy(x=0.0, y=0.0, wait=True), alert=False)
+        await self._set_pen_height(0.0, alert=False)
+        self.grbl = None
+        await asyncio.to_thread(grbl.close)
+        message = f"Disconnected from {grbl.cfg.port}"
+        self._append_comms_log(message)
+        if not silent:
+            ui.notify(message, color="info")
+        self._refresh_serial_ports()
+        self._update_comms_status()
+        self._update_comms_buttons()
+
+    async def _send_gcode_command(self) -> None:
+        if not (self.grbl and self.grbl.ser and getattr(self.grbl.ser, "is_open", False)):
+            ui.notify("Connect to the plotter before sending commands.", color="warning")
+            return
+        if self.gcode_input is None:
+            return
+        raw_text = self.gcode_input.value or ""
+        commands = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if not commands:
+            ui.notify("Enter at least one G-code command.", color="warning")
+            return
+        for command in commands:
+            responses = await self._execute_grbl(f"> {command}", lambda g, cmd=command: g.cmd(cmd), alert=False)
+            if responses is None:
+                break
+            for line in responses:
+                self._append_comms_log(line)
+        self._update_comms_status()
+        if self.gcode_input is not None:
+            self.gcode_input.value = ""
 
     def _canvas_transform(self) -> Tuple[float, float, float]:
         inner_width = self.canvas_size[0] - 2 * self.canvas_margin
@@ -278,16 +837,22 @@ class PlotterApp:
             )
             y += tick
 
-        rect_min_x, rect_min_y = self.state.rect_min
-        rect_max_x, rect_max_y = self.state.rect_max
-        rect_left, rect_bottom = self._world_to_canvas(rect_min_x, rect_min_y)
-        rect_right, rect_top = self._world_to_canvas(rect_max_x, rect_max_y)
-        rect_x = rect_left
-        rect_y = rect_top
-        rect_width = max(1.0, rect_right - rect_left)
-        rect_height = max(1.0, rect_bottom - rect_top)
+        rect_items: List[str] = []
+        corner_items: List[str] = []
+        if self.show_area_overlay:
+            rect_min_x, rect_min_y = self.state.rect_min
+            rect_max_x, rect_max_y = self.state.rect_max
+            rect_left, rect_bottom = self._world_to_canvas(rect_min_x, rect_min_y)
+            rect_right, rect_top = self._world_to_canvas(rect_max_x, rect_max_y)
+            rect_x = rect_left
+            rect_y = rect_top
+            rect_width = max(1.0, rect_right - rect_left)
+            rect_height = max(1.0, rect_bottom - rect_top)
+            rect_items.append(
+                f'<rect x="{rect_x:.1f}" y="{rect_y:.1f}" width="{rect_width:.1f}" height="{rect_height:.1f}" '
+                f'fill="rgba(37, 99, 235, 0.08)" stroke="#2563eb" stroke-width="2" />'
+            )
 
-        corner_items = []
         label_offsets = {
             "BL": (-16, 20),
             "BR": (16, 20),
@@ -295,37 +860,63 @@ class PlotterApp:
             "TR": (16, -16),
         }
         selected = self.state.selected_entity
-        for key in ["BL", "BR", "TL", "TR"]:
-            cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
-            is_selected = selected == ("corner", key)
-            corner_items.append(
-                f'<g>'
-                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{10 if is_selected else 8}" '
-                f'stroke="#2563eb" stroke-width="{3 if is_selected else 2}" fill="#fff" />'
-                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4}" fill="#2563eb" />'
-                f'</g>'
-            )
-            offset_x, offset_y = label_offsets[key]
-            label_x = cx + offset_x
-            label_y = cy + offset_y
-            corner_items.append(
-                f'<text x="{label_x:.1f}" y="{label_y:.1f}" '
-                f'font-size="12" text-anchor="middle" fill="#1f2937">{self.state.corner_heights[key]:.2f}</text>'
-            )
+        if self.show_area_overlay:
+            for key in ["BL", "BR", "TL", "TR"]:
+                cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
+                is_selected = selected == ("corner", key)
+                corner_items.append(
+                    f'<g>'
+                    f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{10 if is_selected else 8}" '
+                    f'stroke="#2563eb" stroke-width="{3 if is_selected else 2}" fill="#fff" />'
+                    f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4}" fill="#2563eb" />'
+                    f'</g>'
+                )
+                offset_x, offset_y = label_offsets[key]
+                label_x = cx + offset_x
+                label_y = cy + offset_y
+                corner_items.append(
+                    f'<text x="{label_x:.1f}" y="{label_y:.1f}" '
+                    f'font-size="12" text-anchor="middle" fill="#1f2937">{self.state.corner_heights[key]:.2f}</text>'
+                )
 
         pot_items = []
-        for pot in self.state.pots:
-            px, py = self._world_to_canvas(*pot.position)
-            is_selected = selected == ("pot", pot.identifier)
-            radius = 12 if is_selected else 10
-            pot_items.append(
-                f'<g>'
-                f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" fill="{pot.color}" '
-                f'stroke="#1f2937" stroke-width="{2 if is_selected else 1.5}" />'
-                f'<text x="{px:.1f}" y="{py + radius + 14:.1f}" font-size="11" '
-                f'text-anchor="middle" fill="#1f2937">Pot {pot.identifier}</text>'
-                f'</g>'
-            )
+        if self.show_pots_overlay:
+            for pot in self.state.pots:
+                px, py = self._world_to_canvas(*pot.position)
+                is_selected = selected == ("pot", pot.identifier)
+                radius = 12 if is_selected else 10
+                pot_items.append(
+                    f'<g>'
+                    f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius}" fill="{pot.color}" '
+                    f'stroke="#1f2937" stroke-width="{2 if is_selected else 1.5}" />'
+                    f'<text x="{px:.1f}" y="{py + radius + 14:.1f}" font-size="11" '
+                    f'text-anchor="middle" fill="#1f2937">Pot {pot.identifier}</text>'
+                    f'</g>'
+                )
+
+        pattern_items: List[str] = []
+        if self.show_pattern_overlay and self.pattern.items:
+            pen_filter = self.preview_pen_choice if getattr(self, "preview_pen_choice", None) else "all"
+            for item in self.pattern.items:
+                if isinstance(item, Polyline):
+                    pts = list(reversed(item.pts)) if item._rev else list(item.pts)
+                elif isinstance(item, Line):
+                    pts = [item.p0, item.p1]
+                elif isinstance(item, Circle):
+                    pts = item.to_polyline().pts
+                else:
+                    continue
+                if len(pts) < 2:
+                    continue
+                pen_id = getattr(item, "pen_id", 0)
+                if pen_filter != "all" and str(pen_id) != str(pen_filter):
+                    continue
+                canvas_pts = [self._world_to_canvas(px, py) for px, py in pts]
+                points_attr = " ".join(f"{cx:.1f},{cy:.1f}" for cx, cy in canvas_pts)
+                color = DEFAULT_PEN_COLORS.get(getattr(item, "pen_id", 0), "#2563eb")
+                pattern_items.append(
+                    f'<polyline points="{points_attr}" class="pattern-stroke" stroke="{color}" stroke-width="{self.pattern_display_width}" />'
+                )
 
         jog_items = []
         jog_layout = self._jog_button_layout(selected)
@@ -349,6 +940,7 @@ class PlotterApp:
           <defs>
             <style>
               .grid-line {{ stroke: #d1d5db; stroke-width: 1; }}
+              .pattern-stroke {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}
             </style>
           </defs>
           <rect x="{bed_left:.1f}" y="{bed_top:.1f}" width="{bed_width_px:.1f}" height="{bed_height_px:.1f}" fill="#f8fafc" stroke="#4b5563" stroke-width="2" rx="12" />
@@ -356,7 +948,8 @@ class PlotterApp:
             {''.join(vertical_lines)}
             {''.join(horizontal_lines)}
           </g>
-          <rect x="{rect_x:.1f}" y="{rect_y:.1f}" width="{rect_width:.1f}" height="{rect_height:.1f}" fill="rgba(37, 99, 235, 0.08)" stroke="#2563eb" stroke-width="2" />
+          {''.join(pattern_items)}
+          {''.join(rect_items)}
           {''.join(corner_items)}
           {''.join(pot_items)}
           {''.join(jog_items)}
@@ -372,10 +965,14 @@ class PlotterApp:
             return None
         kind, key = normalized
         if kind == "corner":
+            if not self.show_area_overlay:
+                return None
             cx, cy = self._world_to_canvas(*self._corner_world_coords(key))
             radius = 10.0
             return cx, cy, radius
         if kind == "pot":
+            if not self.show_pots_overlay:
+                return None
             pot = next((p for p in self.state.pots if p.identifier == key), None)
             if pot is None:
                 return None
@@ -387,6 +984,11 @@ class PlotterApp:
     def _jog_button_layout(self, entity: Optional[Tuple[str, Union[str, int]]]) -> List[Dict[str, float | str]]:
         if not self._is_entity_draggable(entity):
             return []
+        if isinstance(entity, tuple):
+            if entity[0] == "corner" and not self.show_area_overlay:
+                return []
+            if entity[0] == "pot" and not self.show_pots_overlay:
+                return []
         position = self._get_entity_canvas_position(entity)
         if position is None:
             return []
@@ -443,14 +1045,16 @@ class PlotterApp:
         self._update_area_label()
 
     def _hit_test_canvas(self, cx: float, cy: float) -> Optional[Tuple[str, Union[str, int]]]:
-        for key in ["BL", "BR", "TL", "TR"]:
-            hx, hy = self._world_to_canvas(*self._corner_world_coords(key))
-            if math.hypot(cx - hx, cy - hy) <= 14:
-                return ("corner", key)
-        for pot in reversed(self.state.pots):
-            px, py = self._world_to_canvas(*pot.position)
-            if math.hypot(cx - px, cy - py) <= 16:
-                return ("pot", pot.identifier)
+        if self.show_area_overlay:
+            for key in ["BL", "BR", "TL", "TR"]:
+                hx, hy = self._world_to_canvas(*self._corner_world_coords(key))
+                if math.hypot(cx - hx, cy - hy) <= 14:
+                    return ("corner", key)
+        if self.show_pots_overlay:
+            for pot in reversed(self.state.pots):
+                px, py = self._world_to_canvas(*pot.position)
+                if math.hypot(cx - px, cy - py) <= 16:
+                    return ("pot", pot.identifier)
         return None
 
     def _hit_test_jog(self, cx: float, cy: float) -> Optional[Dict[str, Union[float, Tuple[str, Union[str, int]]]]]:
@@ -494,6 +1098,9 @@ class PlotterApp:
         previous = self.state.selected_entity
         if previous != target:
             self._select_entity(target)
+            pos = self._entity_world_position(target)
+            if pos is not None:
+                self._schedule_position_move(*pos, alert=True, safe=True)
             if self._is_entity_draggable(target):
                 self.state.drag_arm = target
             return
@@ -509,6 +1116,7 @@ class PlotterApp:
             self.state.drag_has_moved = False
             self._last_pointer_pos = (cx, cy)
             self.state.drag_arm = None
+            self._enter_safe_pen_mode()
         else:
             self.state.drag_entity = None
             self.state.drag_has_moved = False
@@ -549,6 +1157,22 @@ class PlotterApp:
             if pot:
                 x, y = pot.position
                 self._log_status(f"Jogging to pot #{pot.identifier} at ({x:.1f}, {y:.1f}).")
+        pos = self._entity_world_position(entity)
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=True, safe=True)
+
+    def _entity_world_position(self, entity: Tuple[str, Union[str, int]]) -> Optional[Tuple[float, float]]:
+        normalized = self._normalize_entity(entity)
+        if normalized is None:
+            return None
+        kind, key = normalized
+        if kind == "corner":
+            return self._corner_world_coords(str(key))
+        if kind == "pot":
+            pot = next((p for p in self.state.pots if p.identifier == int(key)), None)
+            if pot:
+                return pot.position
+        return None
 
     def _apply_jog(self, entity: Tuple[str, Union[str, int]], dx: float, dy: float) -> None:
         normalized = self._normalize_entity(entity)
@@ -577,6 +1201,9 @@ class PlotterApp:
             new_y = max(0.0, min(self.state.bed_height, pot.position[1] + dy))
             pot.position = (new_x, new_y)
             self._log_status(f"Jogged pot #{pot.identifier} to ({new_x:.1f}, {new_y:.1f}).")
+        pos = self._entity_world_position((kind, key))
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=False, safe=False)
         self._update_canvas()
         self._update_selection_label()
 
@@ -592,6 +1219,9 @@ class PlotterApp:
             self._update_pot_position(int(key), x, y)
         self._update_canvas()
         self._update_selection_label()
+        pos = self._entity_world_position((kind, key))
+        if pos is not None:
+            self._schedule_position_move(*pos, alert=False, safe=True)
 
     def _update_corner_position(self, key: str, x: float, y: float) -> None:
         key = str(key)
@@ -609,6 +1239,7 @@ class PlotterApp:
 
         self.state.rect_min = (min_x, min_y)
         self.state.rect_max = (max_x, max_y)
+        self._sync_grbl_compensation()
 
     def _update_pot_position(self, identifier: int, x: float, y: float) -> None:
         clamped_x = max(0.0, min(self.state.bed_width, x))
@@ -686,6 +1317,8 @@ class PlotterApp:
             finally:
                 self._suppress_height_event = False
         self.state.z_height = target_height
+        if kind == "corner":
+            self._sync_grbl_compensation()
         self._update_selection_label()
         self._update_canvas()
     # ------------------------------------------------------------------
@@ -714,9 +1347,9 @@ class PlotterApp:
     # Pot controls
     # ------------------------------------------------------------------
     def _build_pot_controls(self) -> None:
-        with ui.card().classes("flex-1 min-w-[320px] p-3 gap-3"):
-            ui.label("Color pots").classes("text-sm font-medium")
-            with ui.row().classes("gap-2 flex-wrap items-center"):
+        with ui.card().classes("flex-1 min-w-[320px] p-2 gap-2"):
+            ui.label("Color pots").classes("text-[12px] font-medium")
+            with ui.row().classes("gap-2 flex-wrap items-center text-[11px]"):
                 self._compact_button("+ Pot", self._add_pot, color="primary")
                 self._compact_button("Delete", self._remove_pot, color="negative")
                 self.color_picker = ui.color_input(value="#3a86ff", on_change=self._on_color_change).props(
@@ -724,73 +1357,1597 @@ class PlotterApp:
                 )
                 self.color_picker.disable()
             self.pot_select = ui.select(
-                options=[],
+                options={},
                 value=None,
                 with_input=False,
                 on_change=self._on_pot_selected,
             ).props("label='Pot selection' dense")
-            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-xs text-gray-500")
+            ui.label("Pots appear as overlay circles with their configured colors.").classes("text-[11px] text-gray-500")
 
     # ------------------------------------------------------------------
-    # Runner panel
+    # Configuration and run panels
     # ------------------------------------------------------------------
-    def _build_runner_panel(self) -> None:
-        with ui.card().classes("flex-1 min-w-[360px] p-4 gap-4"):
-            ui.label("Renderer configuration").classes("text-base font-medium")
-            ui.toggle(options=["start", "centroid", "per_segment", "threshold"], value="per_segment").props(
-                "type=button unelevated toggle-color=primary label='z_mode'"
-            )
-            with ui.row().classes("gap-3"):
-                ui.number(label="z_threshold", value=0.02, min=0.0, max=1000.0, step=0.01)
-                ui.number(label="lift_delta", value=0.2, min=0.0, max=1.0, step=0.01)
-            with ui.row().classes("gap-3"):
-                ui.number(label="settle_down_s", value=0.05, min=0.0, max=5.0, step=0.01)
-                ui.number(label="settle_up_s", value=0.03, min=0.0, max=5.0, step=0.01)
-            with ui.row().classes("gap-3"):
-                ui.number(label="z_step", value=0.1, min=0.0, max=1.0, step=0.01)
-                ui.number(label="z_step_delay", value=0.03, min=0.0, max=1.0, step=0.005)
-            with ui.row().classes("gap-3"):
-                ui.number(label="flush_every", value=200, min=1, step=10)
-                ui.number(label="feed_travel", value=15000, min=1, step=100)
-
-            ui.separator()
-            ui.label("Run options").classes("text-base font-medium")
-            with ui.row().classes("gap-3"):
-                ui.number(label="start_x", value=0.0, min=0.0, step=0.1)
-                ui.number(label="start_y", value=0.0, min=0.0, step=0.1)
-                ui.checkbox("optimize nn")
-            with ui.row().classes("gap-3"):
-                ui.checkbox("combine endpoints", value=True)
-                ui.number(label="join_tol", value=0.05, min=0.0, step=0.01)
-            with ui.row().classes("gap-3"):
-                ui.checkbox("resample", value=True)
-                ui.number(label="max_dev", value=0.1, min=0.0, step=0.01)
-                ui.input(label="max_seg (mm)")
-
-            ui.separator()
-            ui.label("Pen filter").classes("text-base font-medium")
-            ui.select(options=[], with_input=False, multiple=True).props(
-                "hint='Populated after preview' label='Pens'"
+    def _build_config_tab(self) -> None:
+        with ui.card().classes("p-3 gap-3 w-full"):
+            ui.label("Renderer Configuration").classes(
+                "text-[12px] font-semibold text-gray-700 uppercase tracking-wide"
             )
 
-            with ui.row().classes("gap-3"):
-                ui.button("Preview in overlay", color="info", on_click=lambda: self._notify("Preview requested."))
-                ui.button("Start", color="positive", on_click=lambda: self._notify("Run started."))
-                ui.button("Pause", on_click=lambda: self._notify("Run paused/resumed."))
-                ui.button("Stop", color="negative", on_click=lambda: self._notify("Run stopped."))
+            def number_field(
+                label: str,
+                *,
+                value: float,
+                min_value: Optional[float] = None,
+                max_value: Optional[float] = None,
+                step: Optional[float] = None,
+                hint: Optional[str] = None,
+            ) -> ui.number:
+                with ui.column().classes("gap-1"):
+                    with ui.row().classes("items-center justify-between gap-2"):
+                        ui.label(label).classes("text-[10px] text-gray-500")
+                        number = ui.number(
+                            value=value,
+                            min=min_value,
+                            max=max_value,
+                            step=step,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                    if hint:
+                        ui.label(hint).classes("text-[10px] text-gray-400 leading-tight")
+                return number
+
+            with ui.column().classes("gap-3"):
+                with ui.column().classes("gap-2"):
+                    ui.label("Travel").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_travel_feed = number_field("Travel feed (mm/min)", value=15000.0, min_value=1.0, step=100.0)
+                    self.cfg_default_feed_draw = number_field("Default draw feed (mm/min)", value=4000.0, min_value=1.0, step=100.0)
+                    self.cfg_flush_every = number_field(
+                        "Flush every (segments)",
+                        value=200.0,
+                        min_value=1.0,
+                        step=10.0,
+                        hint="Send buffered moves to the controller after this many segments.",
+                    )
+                    self.cfg_display_width = number_field("Display line width", value=1.5, min_value=0.1, max_value=5.0, step=0.1, hint="Preview stroke width on plotting bed.")
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Mode").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_z_mode_toggle = ui.toggle(
+                        options=["start", "centroid", "per_segment", "threshold"],
+                        value="centroid",
+                    ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
+                    self.cfg_z_threshold = number_field(
+                        "Z threshold",
+                        value=0.10,
+                        min_value=0.0,
+                        max_value=1.0,
+                        step=0.01,
+                        hint="Only used with the 'threshold' z-mode.",
+                    )
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Pen Motion").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_default_pen_pressure = number_field("Default pen pressure", value=-0.1, min_value=-1.0, max_value=1.0, step=0.01)
+                    self.cfg_lift_delta = number_field("Lift delta", value=0.4, min_value=0.0, max_value=1.0, step=0.01)
+                    self.cfg_settle_down = number_field("Settle down (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
+                    self.cfg_settle_up = number_field("Settle up (s)", value=0.15, min_value=0.0, max_value=5.0, step=0.01)
+                    self.cfg_z_step = number_field("Z step", value=0.05, min_value=0.0, max_value=1.0, step=0.01)
+                    self.cfg_z_step_delay = number_field("Z step delay (s)", value=0.00, min_value=0.0, max_value=1.0, step=0.005)
+
+                with ui.column().classes("gap-2"):
+                    ui.label("Optimization").classes("text-[11px] font-medium text-gray-600")
+                    self.cfg_nn_checkbox = ui.checkbox("Nearest-neighbour optimization", value=False).classes("text-[11px]")
+                    with ui.column().classes("gap-1 pl-2"):
+                        self.cfg_start_x = number_field(
+                            "Start X (mm)",
+                            value=0.0,
+                            min_value=0.0,
+                            step=0.1,
+                            hint="Only applied when NN optimization is enabled.",
+                        )
+                        self.cfg_start_y = number_field(
+                            "Start Y (mm)",
+                            value=0.0,
+                            min_value=0.0,
+                            step=0.1,
+                        )
+                    with ui.row().classes("items-start justify-between gap-2"):
+                        self.cfg_combine_checkbox = ui.checkbox("Combine endpoints", value=False).classes("text-[11px]")
+                        self.cfg_join_tol = ui.number(
+                            label="Join tol (mm)",
+                            value=0.05,
+                            min=0.0,
+                            step=0.01,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                    with ui.column().classes("gap-1"):
+                        with ui.row().classes("items-center justify-between gap-2"):
+                            self.cfg_resample_checkbox = ui.checkbox("Resample paths", value=True).classes("text-[11px]")
+                            self.cfg_max_dev = ui.number(
+                                label="Max dev (mm)",
+                                value=0.1,
+                                min=0.0,
+                                step=0.01,
+                            ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+                        self.cfg_max_seg = ui.number(
+                            label="Max seg (mm)",
+                            value=0.0,
+                            min=0.0,
+                            step=0.1,
+                        ).props("dense outlined hide-spin-buttons").classes("w-24 text-[11px]")
+    def _build_run_tab(self) -> None:
+        with ui.card().classes("p-2 gap-3"):
+            ui.label("Preview & Run").classes("text-[12px] font-medium text-gray-700 uppercase tracking-wide")
+            self.pen_filter_select = ui.select(
+                options=["All pens"],
+                value="All pens",
+                with_input=False,
+                on_change=self._on_pen_filter_changed,
+            ).props("label='Pen' dense").classes("w-full text-[11px]")
+
+            with ui.row().classes("gap-2"):
+                self.run_start_button = ui.button(
+                    "Start",
+                    color="positive",
+                    on_click=lambda: self._spawn(self._start_plot()),
+                )
+                self.run_pause_button = ui.button(
+                    "Pause",
+                    on_click=lambda: self._spawn(self._toggle_pause_plot()),
+                )
+                self.run_stop_button = ui.button(
+                    "Stop",
+                    color="negative",
+                    on_click=lambda: self._spawn(self._stop_plot()),
+                )
+                self.run_pause_button.disable()
+                self.run_stop_button.disable()
 
             self.progress = ui.linear_progress(value=0.0).props("color=primary")
-            self.progress_label = ui.label("Idle")
+            self.progress_label = ui.label("Idle").classes("text-[11px]")
+            self._update_pen_filter_options()
+            self._update_run_buttons()
+
+    def _pen_ids_in_pattern(self) -> List[int]:
+        pen_ids: set[int] = set()
+        for item in self.pattern.items:
+            pen_id = getattr(item, "pen_id", None)
+            if pen_id is None:
+                continue
+            try:
+                pen_ids.add(int(pen_id))
+            except (TypeError, ValueError):
+                continue
+        return sorted(pen_ids)
+
+    def _pen_filter_options(self) -> List[str]:
+        options: List[str] = ["All pens"]
+        for pen_id in self._pen_ids_in_pattern():
+            options.append(f"Pen {pen_id}")
+        return options
+
+    def _update_pen_filter_options(self) -> None:
+        options = self._pen_filter_options()
+        valid_values = {"all"}
+        valid_values.update({str(pid) for pid in self._pen_ids_in_pattern()})
+        if str(self.preview_pen_choice) not in valid_values:
+            self.preview_pen_choice = "all"
+        if self.pen_filter_select is not None:
+            self.pen_filter_select.options = options
+            self.pen_filter_select.value = self._label_for_pen_choice(self.preview_pen_choice)
+            self.pen_filter_select.update()
+
+    def _on_pen_filter_changed(self, event: events.ValueChangeEventArguments) -> None:
+        label = (event.value or "All pens").strip()
+        self.preview_pen_choice = self._value_from_pen_label(label)
+        self._update_canvas()
+
+    def _float_value(self, control: Any, default: float) -> float:
+        try:
+            value = control.value
+        except AttributeError:
+            return default
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _int_value(self, control: Any, default: Optional[int]) -> Optional[int]:
+        val = self._float_value(control, default if default is not None else 0)
+        if val is None:
+            return default
+        if val <= 0 and default is None:
+            return None
+        return int(round(val))
+
+    async def _send_feed_control(self, command: bytes, description: str) -> None:
+        if not self._is_grbl_ready():
+            return
+        ser = getattr(self.grbl, "ser", None)
+        if ser is None:
+            return
+        try:
+            ser.write(command)
+            ser.flush()
+            self._append_comms_log(description)
+        except Exception as exc:
+            self._append_comms_log(f"[error] {description} failed: {exc}")
+
+    def _sync_grbl_compensation(self) -> None:
+        if not self._is_grbl_ready():
+            return
+        min_x, min_y = self.state.rect_min
+        max_x, max_y = self.state.rect_max
+        if max_x <= min_x or max_y <= min_y:
+            return
+        heights = self.state.corner_heights
+        try:
+            comp = Compensation(
+                area=Rect(min_x, min_y, max_x, max_y),
+                hBL=float(heights.get("BL", 1.0)),
+                hBR=float(heights.get("BR", 1.0)),
+                hTL=float(heights.get("TL", 1.0)),
+                hTR=float(heights.get("TR", 1.0)),
+            )
+            self.grbl.set_compensation(comp)
+        except Exception as exc:
+            self._append_comms_log(f"[error] Failed to update compensation: {exc}")
+
+    def _label_for_pen_choice(self, choice: str) -> str:
+        return "All pens" if choice in (None, "", "all") else f"Pen {choice}"
+
+    def _value_from_pen_label(self, label: str) -> str:
+        label = label.strip()
+        if label.lower().startswith("all"):
+            return "all"
+        if label.lower().startswith("pen"):
+            parts = label.split()
+            if len(parts) >= 2:
+                try:
+                    return str(int(parts[1]))
+                except ValueError:
+                    pass
+        return "all"
+
+    def _collect_run_settings(self) -> Dict[str, Any]:
+        z_mode = self.cfg_z_mode_toggle.value if self.cfg_z_mode_toggle else "per_segment"
+        z_threshold = self._float_value(self.cfg_z_threshold, 0.02)
+        settle_down = self._float_value(self.cfg_settle_down, 0.05)
+        settle_up = self._float_value(self.cfg_settle_up, 0.03)
+        z_step = self._float_value(self.cfg_z_step, 0.0)
+        if z_step <= 0:
+            z_step = None
+        z_step_delay = self._float_value(self.cfg_z_step_delay, 0.03)
+        flush_every = max(1, self._int_value(self.cfg_flush_every, 200) or 200)
+        travel_feed = self._int_value(self.cfg_travel_feed, None)
+        lift_delta = self._float_value(self.cfg_lift_delta, 0.2)
+        default_feed = self._int_value(self.cfg_default_feed_draw, None)
+        default_pen_pressure = self._float_value(self.cfg_default_pen_pressure, -0.1)
+
+        start_x = self._float_value(self.cfg_start_x, 0.0)
+        start_y = self._float_value(self.cfg_start_y, 0.0)
+        optimize = 'nn' if self.cfg_nn_checkbox and self.cfg_nn_checkbox.value else None
+
+        combine = None
+        if self.cfg_combine_checkbox and self.cfg_combine_checkbox.value:
+            combine = {'join_tol_mm': self._float_value(self.cfg_join_tol, 0.05)}
+
+        resample = None
+        if self.cfg_resample_checkbox and self.cfg_resample_checkbox.value:
+            resample = {
+                'max_dev_mm': self._float_value(self.cfg_max_dev, 0.1),
+                'max_seg_mm': None,
+            }
+            max_seg_val = self._float_value(self.cfg_max_seg, 0.0)
+            if max_seg_val > 0:
+                resample['max_seg_mm'] = max_seg_val
+
+        pen_filter = None
+        if self.preview_pen_choice not in (None, "", "all"):
+            try:
+                pen_filter = int(self.preview_pen_choice)
+            except ValueError:
+                pen_filter = None
+
+        return {
+            'renderer': {
+                'z_mode': z_mode,
+                'z_threshold': z_threshold,
+                'settle_down_s': settle_down,
+                'settle_up_s': settle_up,
+                'z_step': z_step,
+                'z_step_delay': z_step_delay,
+                'flush_every': flush_every,
+                'feed_travel': travel_feed,
+                'lift_delta': lift_delta,
+                'pen_colors': DEFAULT_PEN_COLORS,
+                'default_feed_draw': default_feed,
+                'default_pen_pressure': default_pen_pressure,
+            },
+            'default_feed': default_feed,
+            'default_pen_pressure': default_pen_pressure,
+            'start_xy': (start_x, start_y),
+            'optimize': optimize,
+            'resample': resample,
+            'combine': combine,
+            'pen_filter': pen_filter,
+            'return_home': True,
+        }
+
+    def _on_display_width_change(self, e: events.ValueChangeEventArguments) -> None:
+        try:
+            value = float(e.value)
+        except (TypeError, ValueError):
+            return
+        value = max(0.1, min(5.0, value))
+        if abs(self.pattern_display_width - value) < 1e-6:
+            return
+        self.pattern_display_width = value
+        self._update_canvas()
+
+    def _clone_pattern_for_run(self, default_feed: Optional[int], default_pen_pressure: float) -> Pattern:
+        clone = Pattern()
+        for item in self.pattern.items:
+            cloned = self._clone_pattern_item(item)
+            if isinstance(cloned, Polyline):
+                if (cloned.feed_draw is None or cloned.feed_draw <= 0) and default_feed is not None:
+                    cloned.feed_draw = int(default_feed)
+                try:
+                    pen_pressure = float(cloned.pen_pressure)
+                except (TypeError, ValueError):
+                    pen_pressure = -0.1
+                if abs(pen_pressure + 0.1) < 1e-6:
+                    cloned.pen_pressure = float(default_pen_pressure)
+            clone.add(cloned)
+        return clone
+
+    async def _start_plot(self) -> None:
+        if self.run_task and not self.run_task.done():
+            ui.notify("A plot is already running.", color="warning")
+            return
+        if not self.pattern.items:
+            ui.notify("Load a pattern before starting.", color="warning")
+            return
+        if not self._require_grbl(alert=True):
+            return
+
+        settings = self._collect_run_settings()
+        default_feed_draw = settings['default_feed'] if settings['default_feed'] is not None else getattr(self.grbl.cfg, 'feed_draw', None) if hasattr(self.grbl, 'cfg') else None
+        pattern_clone = self._clone_pattern_for_run(default_feed_draw, settings['default_pen_pressure'])
+        if default_feed_draw is not None and hasattr(self.grbl, 'cfg'):
+            try:
+                self.grbl.cfg.feed_draw = int(default_feed_draw)
+            except Exception:
+                pass
+        self._append_comms_log('Starting plot...')
+
+        renderer_kwargs = settings['renderer']
+        renderer_kwargs['pen_colors'] = getattr(self.grbl, 'pen_colors', DEFAULT_PEN_COLORS)
+        renderer_kwargs['default_feed_draw'] = default_feed_draw
+        renderer_kwargs['default_pen_pressure'] = settings['default_pen_pressure']
+        renderer = Renderer(self.grbl, **renderer_kwargs)
+        self.renderer = renderer
+        self.run_paused = False
+        if self.progress_label is not None:
+            self.progress_label.set_text("Running...")
+        self._update_run_buttons()
+
+        async def runner() -> None:
+            try:
+                await asyncio.to_thread(
+                    renderer.run,
+                    pattern_clone,
+                    start_xy=settings['start_xy'],
+                    optimize=settings['optimize'],
+                    resample=settings['resample'],
+                    combine=settings['combine'],
+                    return_home=settings['return_home'],
+                    pen_filter=settings['pen_filter'],
+                    preview_in_widget=False,
+                )
+            except RendererCancelled:
+                self._append_comms_log("Plot cancelled.")
+                try:
+                    ui.notify("Plot cancelled.", color="warning")
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                self._append_comms_log(f"[error] Plot failed: {exc}")
+                try:
+                    ui.notify(f"Plot failed: {exc}", color="negative")
+                except RuntimeError:
+                    pass
+            else:
+                self._append_comms_log("Plot completed.")
+            finally:
+                self.renderer = None
+                self.run_paused = False
+                self.run_task = None
+                if self.progress_label is not None:
+                    self.progress_label.set_text("Idle")
+                self._update_run_buttons()
+
+        self.run_task = asyncio.create_task(runner())
+        self._update_run_buttons()
+
+    async def _toggle_pause_plot(self) -> None:
+        if not self.run_task or self.run_task.done():
+            ui.notify("No active plot to pause.", color="warning")
+            return
+        if not self.renderer:
+            return
+        if not self.run_paused:
+            self.renderer.request_pause()
+            await self._send_feed_control(b'!', 'Feed hold (pause)')
+            self.run_paused = True
+            if self.run_pause_button is not None:
+                self.run_pause_button.set_text("Resume")
+            if self.progress_label is not None:
+                self.progress_label.set_text("Paused")
+            self._append_comms_log("Plot paused.")
+        else:
+            self.renderer.request_resume()
+            await self._send_feed_control(b'~', 'Resume feed')
+            self.run_paused = False
+            if self.run_pause_button is not None:
+                self.run_pause_button.set_text("Pause")
+            if self.progress_label is not None:
+                self.progress_label.set_text("Running...")
+            self._append_comms_log("Plot resumed.")
+        self._update_run_buttons()
+
+    async def _stop_plot(self) -> None:
+        if not self.run_task or self.run_task.done():
+            ui.notify("No active plot to stop.", color="warning")
+            return
+        if self.renderer:
+            self.renderer.request_cancel()
+            await self._send_feed_control(b'~', 'Released feed hold')
+        self._append_comms_log("Stop requested.")
+        try:
+            await self.run_task
+        finally:
+            self.run_task = None
+            self.renderer = None
+            self.run_paused = False
+            await self._send_feed_control(b'~', 'Ensured feed hold released')
+            if self.progress_label is not None:
+                self.progress_label.set_text("Cancelled")
+            self._update_run_buttons()
+
+    def _update_run_buttons(self) -> None:
+        running = bool(self.run_task and not self.run_task.done())
+        if self.run_start_button is not None:
+            if running:
+                self.run_start_button.disable()
+            else:
+                self.run_start_button.enable()
+        if self.run_pause_button is not None:
+            if running:
+                self.run_pause_button.enable()
+                self.run_pause_button.set_text("Resume" if self.run_paused else "Pause")
+            else:
+                self.run_pause_button.disable()
+                self.run_pause_button.set_text("Pause")
+        if self.run_stop_button is not None:
+            if running:
+                self.run_stop_button.enable()
+            else:
+                self.run_stop_button.disable()
+
+    def _preview_selected_pen(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        selected = self.preview_pen_choice or "all"
+        if selected != "all":
+            pen_ids = {str(pid) for pid in self._pen_ids_in_pattern()}
+            if selected not in pen_ids:
+                ui.notify(f"Pen {selected} not present in current pattern.", color="warning")
+                return
+        self._update_canvas()
+        if selected == "all":
+            message = "Preview updated to show all pens."
+        else:
+            message = f"Preview updated to show pen {selected}."
+        ui.notify(message, color="positive")
+        self._log_status(message)
+
+    def _build_load_tab(self) -> None:
+        with ui.card().classes("p-2 gap-3 w-full"):
+            ui.label("Import Pattern").classes("text-[12px] font-medium text-gray-700")
+            with ui.row().classes("gap-2 items-center flex-wrap"):
+                ui.upload(
+                    label="Upload SVG",
+                    auto_upload=True,
+                    on_upload=self._handle_svg_upload,
+                    max_file_size=5 * 1024 * 1024,
+                    multiple=False,
+                ).props("accept='.svg' color=primary outline dense")
+                ui.button(
+                    "Load Script",
+                    on_click=self._load_pattern_from_script,
+                    color="primary",
+                ).props("unelevated size='sm'")
+                ui.button(
+                    "Fill Example Script",
+                    on_click=self._populate_example_script,
+                ).props("size='sm'")
+                ui.button(
+                    "Clear Pattern",
+                    on_click=self._clear_pattern,
+                    color="negative",
+                ).props("outline size='sm'")
+            self.pattern_summary_label = ui.label("No pattern loaded.").classes("text-[11px] text-gray-600")
+
+        with ui.card().classes("p-2 gap-2 w-full"):
+            ui.label("Script Input").classes("text-[12px] font-medium text-gray-700")
+            self.pattern_script_area = ui.textarea(
+                placeholder="Enter pattern script…",
+            ).props("autogrow rows=6 dense").classes("w-full")
+            ui.label(
+                "Commands: LINE x1 y1 x2 y2, POLYLINE x1 y1 x2 y2 ..., CIRCLE cx cy radius "
+                "(optional start_deg sweep_deg). Extra options: pen=<id> pressure=<float> feed=<mm/min>."
+            ).classes("text-[10px] text-gray-500 leading-tight")
+
+        with ui.card().classes("p-2 gap-3 w-full"):
+            ui.label("Display").classes("text-[12px] font-medium text-gray-700")
+            self.display_width_slider = ui.slider(
+                min=0.1,
+                max=5.0,
+                step=0.1,
+                value=self.pattern_display_width,
+                on_change=self._on_display_width_change,
+            ).props("dense").classes("w-full")
+            ui.label("Adjusts stroke width in the preview only.").classes("text-[10px] text-gray-500")
+
+        with ui.card().classes("p-2 gap-3 w-full"):
+            ui.label("Transform Pattern").classes(
+                "text-[12px] font-semibold text-gray-700 text-center tracking-wide uppercase"
+            )
+            button_classes = "w-[36px] min-w-[36px] px-1 py-1 text-[10px]"
+            row_classes = "gap-1 w-full justify-evenly flex-nowrap"
+            with ui.column().classes("gap-3"):
+                ui.label("Rotate (°)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for deg in (-90, -10, -1, 1, 10, 90):
+                        label = f"{deg:+}°"
+                        ui.button(
+                            label,
+                            on_click=lambda d=deg: self._rotate_pattern(d),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern(p),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom X (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern_x(p),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Zoom Y (%)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for pct in (-50, -10, -1, 1, 10, 100):
+                        label = f"{pct:+}%"
+                        ui.button(
+                            label,
+                            on_click=lambda p=pct: self._scale_pattern_y(p),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Shift X (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for offset in (-100, -10, -1, 1, 10, 100):
+                        label = f"{offset:+}"
+                        ui.button(
+                            label,
+                            on_click=lambda dx=offset: self._translate_pattern(dx, 0.0),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Shift Y (mm)").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    for offset in (-100, -10, -1, 1, 10, 100):
+                        label = f"{offset:+}"
+                        ui.button(
+                            label,
+                            on_click=lambda dy=offset: self._translate_pattern(0.0, dy),
+                        ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Flip").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    ui.button(
+                        "X",
+                        on_click=lambda: self._flip_pattern("x"),
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Y",
+                        on_click=lambda: self._flip_pattern("y"),
+                    ).props("outline size='xs' dense").classes(button_classes)
+                ui.label("Fit").classes("text-[10px] uppercase text-gray-500 tracking-wide text-center")
+                with ui.row().classes(row_classes):
+                    ui.button(
+                        "Center",
+                        on_click=self._center_pattern,
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Scale W",
+                        on_click=self._scale_pattern_to_width,
+                    ).props("outline size='xs' dense").classes(button_classes)
+                    ui.button(
+                        "Scale H",
+                        on_click=self._scale_pattern_to_height,
+                    ).props("outline size='xs' dense").classes(button_classes)
+
+    async def _handle_svg_upload(self, event: events.UploadEventArguments) -> None:
+        uploads: List[Any] = []
+        if hasattr(event, "files") and event.files:
+            uploads = list(event.files)
+        elif hasattr(event, "file") and event.file:
+            uploads = [event.file]
+        data: Optional[bytes] = None
+        upload = uploads[0] if uploads else None
+        if upload is not None:
+            try:
+                if hasattr(upload, "read"):
+                    data = await upload.read()
+                elif hasattr(upload, "content"):
+                    data = upload.content
+            except Exception as exc:
+                ui.notify(f"Failed to read upload: {exc}", color="negative")
+                self._log_status(f"Upload read failed: {exc}")
+                return
+        if data is None and hasattr(event, "content") and event.content:
+            data = event.content
+        if data is None:
+            ui.notify("No file received.", color="warning")
+            return
+        try:
+            pattern = self._pattern_from_svg_bytes(data)
+        except ValueError as exc:
+            ui.notify(f"SVG import failed: {exc}", color="negative")
+            self._log_status(f"SVG import failed: {exc}")
+            return
+        filename = (
+            getattr(upload, "name", None)
+            or getattr(event, "name", None)
+            or "uploaded.svg"
+        )
+        self._set_pattern(pattern, filename)
+        ui.notify(f"Loaded {filename}", color="positive")
+        self._log_status(f"Loaded pattern from {filename}.")
+
+    def _clear_pattern(self) -> None:
+        self.pattern = Pattern()
+        self.pattern_has_data = False
+        self.pattern_name = "Empty"
+        self.preview_pen_choice = "all"
+        self._update_pattern_summary()
+        self._update_pen_filter_options()
+        self._update_canvas()
+        ui.notify("Pattern cleared.", color="info")
+        self._log_status("Cleared current pattern.")
+
+    def _populate_example_script(self) -> None:
+        example = (
+            "# Example pattern\n"
+            "LINE 0 0 120 0\n"
+            "LINE 120 0 120 80\n"
+            "LINE 120 80 0 80\n"
+            "LINE 0 80 0 0\n"
+            "POLYLINE 20 20 60 60 100 20\n"
+            "CIRCLE 60 40 18\n"
+        )
+        if self.pattern_script_area is not None:
+            self.pattern_script_area.set_value(example)
+        ui.notify("Example script inserted.", color="primary")
+
+    def _load_pattern_from_script(self) -> None:
+        if self.pattern_script_area is None:
+            ui.notify("Script area unavailable.", color="negative")
+            return
+        script_text = (self.pattern_script_area.value or "").strip()
+        if not script_text:
+            ui.notify("Script area is empty.", color="warning")
+            return
+        try:
+            pattern = self._parse_pattern_script(script_text)
+        except ValueError as exc:
+            ui.notify(f"Script error: {exc}", color="negative")
+            self._log_status(f"Pattern script failed: {exc}")
+            return
+        self._set_pattern(pattern, "Script import")
+        ui.notify("Script imported.", color="positive")
+        self._log_status("Loaded pattern from script.")
+
+    def _set_pattern(self, pattern: Pattern, source_name: str) -> None:
+        sanitized = Pattern()
+        for item in pattern.items:
+            cloned = self._clone_pattern_item(item)
+            sanitized.add(cloned)
+        bounds = self._pattern_bounds(sanitized)
+        if bounds is not None:
+            area_min_x, area_min_y = self.state.rect_min
+            area_max_x, area_max_y = self.state.rect_max
+            area_center_x = (area_min_x + area_max_x) / 2.0
+            area_center_y = (area_min_y + area_max_y) / 2.0
+            pattern_center_x, pattern_center_y = self._pattern_center(sanitized)
+            dx = area_center_x - pattern_center_x
+            dy = area_center_y - pattern_center_y
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                for item in sanitized.items:
+                    if isinstance(item, Polyline):
+                        item.pts = [(x + dx, y + dy) for x, y in item.pts]
+                    elif isinstance(item, Line):
+                        item.p0 = (item.p0[0] + dx, item.p0[1] + dy)
+                        item.p1 = (item.p1[0] + dx, item.p1[1] + dy)
+                    elif isinstance(item, Circle):
+                        item.c = (item.c[0] + dx, item.c[1] + dy)
+        self.pattern = sanitized
+        self.pattern_has_data = bool(self.pattern.items)
+        self.pattern_name = source_name
+        self.preview_pen_choice = "all"
+        self._update_pattern_summary()
+        self._update_pen_filter_options()
+        self._update_canvas()
+
+    def _clone_pattern_item(self, item: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
+        if isinstance(item, Polyline):
+            return Polyline(
+                pts=[(float(x), float(y)) for x, y in item.pts],
+                pen_pressure=float(item.pen_pressure),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        if isinstance(item, Line):
+            return Line(
+                p0=(float(item.p0[0]), float(item.p0[1])),
+                p1=(float(item.p1[0]), float(item.p1[1])),
+                pen_pressure=float(item.pen_pressure),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        if isinstance(item, Circle):
+            return Circle(
+                c=(float(item.c[0]), float(item.c[1])),
+                r=float(item.r),
+                start_deg=float(item.start_deg),
+                sweep_deg=float(item.sweep_deg),
+                pen_pressure=float(item.pen_pressure),
+                seg_len_mm=float(item.seg_len_mm),
+                name=item.name,
+                feed_draw=item.feed_draw,
+                pen_id=item.pen_id,
+                _rev=item._rev,
+            )
+        raise TypeError(f"Unsupported pattern item: {type(item).__name__}")
+
+    def _update_pattern_summary(self) -> None:
+        if self.pattern_summary_label is None:
+            return
+        if not self.pattern.items:
+            self.pattern_summary_label.set_text("No pattern loaded.")
+            return
+        bounds = self._pattern_bounds()
+        stroke_count = sum(
+            1
+            for it in self.pattern.items
+            if isinstance(it, Polyline) and len(it.pts) >= 2
+        )
+        if bounds is None:
+            summary = f"{self.pattern_name}: {stroke_count} strokes."
+        else:
+            min_x, min_y, max_x, max_y = bounds
+            width = max_x - min_x
+            height = max_y - min_y
+            summary = (
+                f"{self.pattern_name}: {stroke_count} strokes | "
+                f"bbox [{min_x:.1f}, {min_y:.1f}] – [{max_x:.1f}, {max_y:.1f}] "
+                f"({width:.1f} × {height:.1f} mm)"
+            )
+        self.pattern_summary_label.set_text(summary)
+
+    def _pattern_bounds(self, pattern_obj: Optional[Pattern] = None) -> Optional[Tuple[float, float, float, float]]:
+        if pattern_obj is None:
+            pattern_obj = self.pattern
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        found = False
+        for item in pattern_obj.items:
+            if isinstance(item, Polyline):
+                points = item.pts
+            elif isinstance(item, Line):
+                points = [item.p0, item.p1]
+            elif isinstance(item, Circle):
+                points = item.to_polyline().pts
+            else:
+                continue
+            for x, y in points:
+                min_x = min(min_x, float(x))
+                min_y = min(min_y, float(y))
+                max_x = max(max_x, float(x))
+                max_y = max(max_y, float(y))
+                found = True
+        if not found:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    def _pattern_center(self, pattern_obj: Optional[Pattern] = None) -> Tuple[float, float]:
+        bounds = self._pattern_bounds(pattern_obj)
+        if bounds is None:
+            return (0.0, 0.0)
+        min_x, min_y, max_x, max_y = bounds
+        return (0.5 * (min_x + max_x), 0.5 * (min_y + max_y))
+
+    def _apply_pattern_transform(self, transformer: Callable[[float, float], Tuple[float, float]]) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        for item in self.pattern.items:
+            if isinstance(item, Polyline):
+                item.pts = [transformer(float(x), float(y)) for x, y in item.pts]
+        self._update_pattern_summary()
+        self._update_canvas()
+
+    def _rotate_pattern(self, degrees: float) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        cx, cy = self._pattern_center()
+        rad = math.radians(degrees)
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            dx = x - cx
+            dy = y - cy
+            return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+        self._apply_pattern_transform(transform)
+        self._log_status(f"Rotated pattern by {degrees:+.1f}°.")
+
+    def _scale_pattern(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center(factor):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_x(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center_axes(factor, 1.0):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern width {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_y(self, percent: float) -> None:
+        factor = 1.0 + percent / 100.0
+        if not self._scale_pattern_about_center_axes(1.0, factor):
+            return
+        change = "larger" if percent >= 0 else "smaller"
+        self._log_status(f"Scaled pattern height {change} by {percent:+.0f}%.")
+
+    def _scale_pattern_about_center(self, factor: float) -> bool:
+        return self._scale_pattern_about_center_axes(factor, factor)
+
+    def _scale_pattern_about_center_axes(self, factor_x: float, factor_y: float) -> bool:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return False
+        if factor_x <= 0.01 or factor_y <= 0.01:
+            ui.notify("Scale factor too small; choose a larger value.", color="warning")
+            return False
+        cx, cy = self._pattern_center()
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (cx + (x - cx) * factor_x, cy + (y - cy) * factor_y)
+
+        self._apply_pattern_transform(transform)
+        return True
+
+    def _translate_pattern(self, dx: float, dy: float) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (x + dx, y + dy)
+
+        self._apply_pattern_transform(transform)
+        self._log_status(f"Shifted pattern by Δx={dx:+.1f}, Δy={dy:+.1f}.")
+
+    def _flip_pattern(self, axis: str) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        cx, cy = self._pattern_center()
+        axis = axis.lower()
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            if axis == "x":
+                return (2 * cx - x, y)
+            if axis == "y":
+                return (x, 2 * cy - y)
+            return (x, y)
+
+        self._apply_pattern_transform(transform)
+        axis_name = "X-axis" if axis == "x" else "Y-axis"
+        self._log_status(f"Flipped pattern across {axis_name}.")
+
+    def _center_pattern(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to center.", color="warning")
+            return
+        area_min_x, area_min_y = self.state.rect_min
+        area_max_x, area_max_y = self.state.rect_max
+        area_center_x = (area_min_x + area_max_x) / 2.0
+        area_center_y = (area_min_y + area_max_y) / 2.0
+        pattern_center_x, pattern_center_y = self._pattern_center()
+        dx = area_center_x - pattern_center_x
+        dy = area_center_y - pattern_center_y
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            self._log_status("Pattern already centered in selected area.")
+            return
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (x + dx, y + dy)
+
+        self._apply_pattern_transform(transform)
+        self._log_status("Centered pattern in selected area.")
+
+    def _scale_pattern_to_width(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to scale.", color="warning")
+            return
+        min_x, _, max_x, _ = bounds
+        pattern_width = max_x - min_x
+        if pattern_width <= 1e-6:
+            ui.notify("Pattern width is zero; cannot scale.", color="warning")
+            return
+        area_min_x, _ = self.state.rect_min
+        area_max_x, _ = self.state.rect_max
+        area_width = area_max_x - area_min_x
+        if area_width <= 1e-6:
+            ui.notify("Work area width is zero; adjust the selection first.", color="warning")
+            return
+        factor = area_width / pattern_width
+        if abs(factor - 1.0) < 1e-6:
+            self._log_status("Pattern already matches work area width.")
+            return
+        if not self._scale_pattern_about_center(factor):
+            return
+        self._log_status(f"Scaled pattern to selected width ({area_width:.1f} mm).")
+
+    def _scale_pattern_to_height(self) -> None:
+        if not self.pattern.items:
+            ui.notify("No pattern loaded.", color="warning")
+            return
+        bounds = self._pattern_bounds()
+        if bounds is None:
+            ui.notify("Pattern has no geometry to scale.", color="warning")
+            return
+        _, min_y, _, max_y = bounds
+        pattern_height = max_y - min_y
+        if pattern_height <= 1e-6:
+            ui.notify("Pattern height is zero; cannot scale.", color="warning")
+            return
+        _, area_min_y = self.state.rect_min
+        _, area_max_y = self.state.rect_max
+        area_height = area_max_y - area_min_y
+        if area_height <= 1e-6:
+            ui.notify("Work area height is zero; adjust the selection first.", color="warning")
+            return
+        factor = area_height / pattern_height
+        if abs(factor - 1.0) < 1e-6:
+            self._log_status("Pattern already matches work area height.")
+            return
+        if not self._scale_pattern_about_center(factor):
+            return
+        self._log_status(f"Scaled pattern to selected height ({area_height:.1f} mm).")
+
+    def _parse_pattern_script(self, script_text: str) -> Pattern:
+        pattern = Pattern()
+        for line_number, raw_line in enumerate(script_text.splitlines(), start=1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            line = line.replace(",", " ")
+            tokens = [tok for tok in re.split(r"\s+", line) if tok]
+            if not tokens:
+                continue
+            command = tokens[0].lower()
+            args = tokens[1:]
+            numeric_values: List[float] = []
+            options: Dict[str, str] = {}
+            for token in args:
+                token_clean = token.strip().rstrip(",")
+                if "=" in token_clean:
+                    key, value = token_clean.split("=", 1)
+                    options[key.lower()] = value
+                else:
+                    try:
+                        numeric_values.append(float(token_clean))
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Line {line_number}: could not parse number '{token_clean}'."
+                        ) from exc
+
+            def apply_common(obj: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
+                if "pen" in options:
+                    obj.pen_id = int(float(options["pen"]))
+                if "pressure" in options:
+                    obj.pen_pressure = float(options["pressure"])
+                if "feed" in options:
+                    obj.feed_draw = int(float(options["feed"]))
+                if "name" in options:
+                    obj.name = options["name"]
+                return obj
+
+            if command == "line":
+                if len(numeric_values) < 4:
+                    raise ValueError(f"Line {line_number}: LINE requires 4 numbers.")
+                line_obj = Line(
+                    p0=(numeric_values[0], numeric_values[1]),
+                    p1=(numeric_values[2], numeric_values[3]),
+                )
+                pattern.add(apply_common(line_obj))
+            elif command == "polyline":
+                if len(numeric_values) < 4 or len(numeric_values) % 2 != 0:
+                    raise ValueError(
+                        f"Line {line_number}: POLYLINE requires an even number of coordinates (>=4)."
+                    )
+                points = [
+                    (numeric_values[i], numeric_values[i + 1]) for i in range(0, len(numeric_values), 2)
+                ]
+                poly_obj = Polyline(pts=points)
+                pattern.add(apply_common(poly_obj))
+            elif command == "circle":
+                if len(numeric_values) < 3:
+                    raise ValueError(f"Line {line_number}: CIRCLE requires center_x center_y radius.")
+                cx, cy, radius = numeric_values[:3]
+                start_deg = numeric_values[3] if len(numeric_values) >= 4 else 0.0
+                sweep_deg = numeric_values[4] if len(numeric_values) >= 5 else 360.0
+                circle_obj = Circle(c=(cx, cy), r=radius, start_deg=start_deg, sweep_deg=sweep_deg)
+                pattern.add(apply_common(circle_obj))
+            else:
+                raise ValueError(f"Line {line_number}: unknown command '{command}'.")
+        if not pattern.items:
+            raise ValueError("No drawing commands found in script.")
+        return pattern
+
+    def _pattern_from_svg_bytes(self, data: bytes) -> Pattern:
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as exc:
+            raise ValueError(f"Invalid SVG: {exc}") from exc
+
+        pattern = Pattern()
+
+        style_classes: Dict[str, Dict[str, str]] = {}
+
+        def parse_style_text(text: str) -> None:
+            for cls, body in re.findall(r"\.([A-Za-z0-9_-]+)\s*\{([^}]*)\}", text or "", flags=re.MULTILINE):
+                props: Dict[str, str] = {}
+                for decl in body.split(';'):
+                    if ':' not in decl:
+                        continue
+                    key, val = decl.split(':', 1)
+                    props[key.strip().lower()] = val.strip()
+                if props:
+                    style_classes[cls] = props
+
+        for style_elem in root.findall('.//{http://www.w3.org/2000/svg}style'):
+            parse_style_text(style_elem.text or "")
+
+        color_to_pen: Dict[str, int] = {}
+
+        def normalize_color(color: str) -> str:
+            return color.strip().lower()
+
+        def pen_id_for_color(color: Optional[str]) -> Optional[int]:
+            color_norm = normalize_color(color or '')
+            if color_norm in {"none", "transparent"}:
+                return None
+            if color_norm == "":
+                color_norm = "#000000"
+            if color_norm not in color_to_pen:
+                color_to_pen[color_norm] = len(color_to_pen)
+            return color_to_pen[color_norm]
+
+        def parse_style_attr(style_value: str) -> Dict[str, str]:
+            result: Dict[str, str] = {}
+            for decl in style_value.split(';'):
+                if ':' not in decl:
+                    continue
+                key, val = decl.split(':', 1)
+                result[key.strip().lower()] = val.strip()
+            return result
+
+        def resolve_styles(element: ET.Element) -> Dict[str, str]:
+            styles: Dict[str, str] = {}
+            class_attr = element.get('class', '')
+            if class_attr:
+                for cls in class_attr.split():
+                    props = style_classes.get(cls)
+                    if props:
+                        styles.update(props)
+            inline_style = element.get('style')
+            if inline_style:
+                styles.update(parse_style_attr(inline_style))
+            for attr in ('stroke', 'fill', 'stroke-width'):
+                if attr in element.attrib:
+                    styles[attr] = element.attrib[attr]
+            return styles
+
+        def traverse(element: ET.Element, transform: Tuple[float, float, float, float, float, float]) -> None:
+            current_transform = transform
+            if "transform" in element.attrib:
+                extra = self._parse_svg_transform(element.attrib["transform"])
+                current_transform = self._combine_transform(transform, extra)
+
+            styles = resolve_styles(element)
+            stroke = styles.get("stroke")
+            fill = styles.get("fill")
+
+            stroke_norm = normalize_color(stroke or "")
+            if stroke_norm in {"", "none", "transparent"}:
+                chosen_color = fill
+            else:
+                chosen_color = stroke
+
+            pen_id = pen_id_for_color(chosen_color)
+
+            tag = self._svg_tag_name(element.tag)
+
+            def should_skip() -> bool:
+                return pen_id is None
+
+            if tag == "line":
+                try:
+                    x1 = float(element.get("x1", "0"))
+                    y1 = float(element.get("y1", "0"))
+                    x2 = float(element.get("x2", "0"))
+                    y2 = float(element.get("y2", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid line coordinates in SVG: {exc}") from exc
+                if not should_skip():
+                    p0 = self._apply_transform(current_transform, x1, y1)
+                    p1 = self._apply_transform(current_transform, x2, y2)
+                    pattern.add(Polyline(pts=[p0, p1], pen_id=pen_id))
+            elif tag in {"polyline", "polygon"}:
+                points_attr = element.get("points", "")
+                points = self._parse_svg_points(points_attr)
+                if tag == "polygon" and points and points[0] != points[-1]:
+                    points.append(points[0])
+                transformed = [self._apply_transform(current_transform, x, y) for x, y in points]
+                if len(transformed) >= 2 and not should_skip():
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
+            elif tag == "path":
+                d_attr = element.get("d", "")
+                if d_attr:
+                    subpaths = self._parse_svg_path(d_attr)
+                    for subpath in subpaths:
+                        transformed = [self._apply_transform(current_transform, x, y) for x, y in subpath]
+                        if len(transformed) >= 2 and not self._is_rectangle_path(transformed) and not should_skip():
+                            pattern.add(Polyline(pts=transformed, pen_id=pen_id))
+            elif tag == "circle":
+                try:
+                    cx = float(element.get("cx", "0"))
+                    cy = float(element.get("cy", "0"))
+                    r = float(element.get("r", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid circle in SVG: {exc}") from exc
+                if not should_skip():
+                    base_circle = Circle(c=(cx, cy), r=r)
+                    poly = base_circle.to_polyline()
+                    transformed = [self._apply_transform(current_transform, x, y) for x, y in poly.pts]
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
+            elif tag == "ellipse":
+                try:
+                    cx = float(element.get("cx", "0"))
+                    cy = float(element.get("cy", "0"))
+                    rx = float(element.get("rx", "0"))
+                    ry = float(element.get("ry", "0"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid ellipse in SVG: {exc}") from exc
+                if not should_skip():
+                    segments = 64
+                    transformed = []
+                    for k in range(segments + 1):
+                        theta = 2 * math.pi * k / segments
+                        x = cx + rx * math.cos(theta)
+                        y = cy + ry * math.sin(theta)
+                        transformed.append(self._apply_transform(current_transform, x, y))
+                    pattern.add(Polyline(pts=transformed, pen_id=pen_id))
+
+            for child in element:
+                traverse(child, current_transform)
+
+        traverse(root, self._identity_transform())
+
+        if not pattern.items:
+            raise ValueError("No supported shapes found in SVG.")
+        return pattern
+
+    def _svg_tag_name(self, tag: str) -> str:
+        if "}" in tag:
+            return tag.split("}", 1)[1]
+        return tag
+
+    def _parse_svg_points(self, points: str) -> List[Tuple[float, float]]:
+        raw_tokens = re.split(r"[,\s]+", points.strip())
+        values: List[float] = []
+        for tok in raw_tokens:
+            if not tok:
+                continue
+            try:
+                values.append(float(tok))
+            except ValueError:
+                pass
+        paired = [
+            (values[i], values[i + 1])
+            for i in range(0, len(values) - 1, 2)
+        ]
+        return paired
+
+    def _tokenize_svg_path(self, d: str) -> List[Any]:
+        tokens: List[Any] = []
+        number_re = re.compile(r"[-+]?((\d*\.\d+)|(\d+))(?:[eE][-+]?\d+)?")
+        i = 0
+        length = len(d)
+        while i < length:
+            ch = d[i]
+            if ch.isalpha():
+                tokens.append(ch)
+                i += 1
+            elif ch in ", \t\n\r":
+                i += 1
+            else:
+                match = number_re.match(d, i)
+                if match:
+                    tokens.append(float(match.group(0)))
+                    i = match.end()
+                else:
+                    i += 1
+        return tokens
+
+    def _approximate_cubic(self, p0: Tuple[float, float], p1: Tuple[float, float],
+                           p2: Tuple[float, float], p3: Tuple[float, float], segments: int = 12) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for i in range(segments + 1):
+            t = i / segments
+            mt = 1.0 - t
+            x = (mt ** 3) * p0[0] + 3 * (mt ** 2) * t * p1[0] + 3 * mt * (t ** 2) * p2[0] + (t ** 3) * p3[0]
+            y = (mt ** 3) * p0[1] + 3 * (mt ** 2) * t * p1[1] + 3 * mt * (t ** 2) * p2[1] + (t ** 3) * p3[1]
+            points.append((x, y))
+        return points
+
+    def _approximate_quadratic(self, p0: Tuple[float, float], p1: Tuple[float, float],
+                               p2: Tuple[float, float], segments: int = 8) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for i in range(segments + 1):
+            t = i / segments
+            mt = 1.0 - t
+            x = (mt ** 2) * p0[0] + 2 * mt * t * p1[0] + (t ** 2) * p2[0]
+            y = (mt ** 2) * p0[1] + 2 * mt * t * p1[1] + (t ** 2) * p2[1]
+            points.append((x, y))
+        return points
+
+    def _parse_svg_path(self, d: str) -> List[List[Tuple[float, float]]]:
+        tokens = self._tokenize_svg_path(d)
+        if not tokens:
+            return []
+
+        command_params = {
+            'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4, 'Q': 4, 'T': 2, 'A': 7, 'Z': 0
+        }
+
+        subpaths: List[List[Tuple[float, float]]] = []
+        current_path: List[Tuple[float, float]] = []
+        cx = cy = 0.0
+        sx = sy = 0.0
+        cursor = 0
+        current_cmd: Optional[str] = None
+        prev_ctrl_cubic: Optional[Tuple[float, float]] = None
+        prev_ctrl_quad: Optional[Tuple[float, float]] = None
+
+        def add_point(px: float, py: float) -> None:
+            nonlocal current_path
+            if not current_path or abs(current_path[-1][0] - px) > 1e-9 or abs(current_path[-1][1] - py) > 1e-9:
+                current_path.append((px, py))
+
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if isinstance(token, str):
+                current_cmd = token
+                cursor += 1
+                if current_cmd in 'Zz':
+                    if current_path:
+                        add_point(sx, sy)
+                        subpaths.append(current_path)
+                        current_path = []
+                    cx, cy = sx, sy
+                    prev_ctrl_cubic = None
+                    prev_ctrl_quad = None
+                continue
+
+            if current_cmd is None:
+                cursor += 1
+                continue
+
+            cmd = current_cmd
+            upper = cmd.upper()
+            param_count = command_params.get(upper, None)
+            if param_count is None:
+                cursor += 1
+                continue
+
+            if cursor + param_count > len(tokens) or any(isinstance(tokens[cursor + j], str) for j in range(param_count)):
+                current_cmd = None
+                continue
+
+            params = [float(tokens[cursor + j]) for j in range(param_count)]
+            cursor += param_count
+            is_relative = cmd.islower()
+
+            if upper == 'M':
+                if current_path:
+                    subpaths.append(current_path)
+                x, y = params
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                sx, sy = x, y
+                current_path = [(x, y)]
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                current_cmd = 'L' if cmd == 'M' else 'l'
+                continue
+
+            if upper == 'L':
+                x, y = params
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                add_point(x, y)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'H':
+                x = params[0]
+                if is_relative:
+                    x += cx
+                cx = x
+                add_point(cx, cy)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'V':
+                y = params[0]
+                if is_relative:
+                    y += cy
+                cy = y
+                add_point(cx, cy)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'C':
+                x1, y1, x2, y2, x, y = params
+                if is_relative:
+                    x1 += cx
+                    y1 += cy
+                    x2 += cx
+                    y2 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_cubic((cx, cy), (x1, y1), (x2, y2), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_cubic = (x2, y2)
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'S':
+                x2, y2, x, y = params
+                if prev_ctrl_cubic is not None:
+                    x1 = 2 * cx - prev_ctrl_cubic[0]
+                    y1 = 2 * cy - prev_ctrl_cubic[1]
+                else:
+                    x1, y1 = cx, cy
+                if is_relative:
+                    x2 += cx
+                    y2 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_cubic((cx, cy), (x1, y1), (x2, y2), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_cubic = (x2, y2)
+                prev_ctrl_quad = None
+                continue
+
+            if upper == 'Q':
+                x1, y1, x, y = params
+                if is_relative:
+                    x1 += cx
+                    y1 += cy
+                    x += cx
+                    y += cy
+                points = self._approximate_quadratic((cx, cy), (x1, y1), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_quad = (x1, y1)
+                prev_ctrl_cubic = None
+                continue
+
+            if upper == 'T':
+                x, y = params
+                if prev_ctrl_quad is not None:
+                    x1 = 2 * cx - prev_ctrl_quad[0]
+                    y1 = 2 * cy - prev_ctrl_quad[1]
+                else:
+                    x1, y1 = cx, cy
+                if is_relative:
+                    x += cx
+                    y += cy
+                points = self._approximate_quadratic((cx, cy), (x1, y1), (x, y))
+                for px, py in points[1:]:
+                    add_point(px, py)
+                cx, cy = x, y
+                prev_ctrl_quad = (x1, y1)
+                prev_ctrl_cubic = None
+                continue
+
+            if upper == 'A':
+                # Approximate arcs with straight line to the endpoint for simplicity
+                x = params[-2]
+                y = params[-1]
+                if is_relative:
+                    x += cx
+                    y += cy
+                cx, cy = x, y
+                add_point(x, y)
+                prev_ctrl_cubic = None
+                prev_ctrl_quad = None
+                continue
+
+        if current_path:
+            subpaths.append(current_path)
+
+        return subpaths
+
+    def _is_rectangle_path(self, points: List[Tuple[float, float]], *, tolerance: float = 1e-3) -> bool:
+        if len(points) < 4:
+            return False
+        if math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1]) <= tolerance:
+            pts = points[:-1]
+        else:
+            pts = points
+        if len(pts) != 4:
+            return False
+        xs = {round(p[0], 3) for p in pts}
+        ys = {round(p[1], 3) for p in pts}
+        if len(xs) != 2 or len(ys) != 2:
+            return False
+        # Check each edge is axis-aligned
+        for a, b in zip(pts, pts[1:] + pts[:1]):
+            dx = abs(a[0] - b[0])
+            dy = abs(a[1] - b[1])
+            if not ((dx <= tolerance and dy > tolerance) or (dy <= tolerance and dx > tolerance)):
+                return False
+        return True
+
+    def _identity_transform(self) -> Tuple[float, float, float, float, float, float]:
+        return (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    def _combine_transform(
+        self,
+        base: Tuple[float, float, float, float, float, float],
+        extra: Tuple[float, float, float, float, float, float],
+    ) -> Tuple[float, float, float, float, float, float]:
+        a1, b1, c1, d1, e1, f1 = base
+        a2, b2, c2, d2, e2, f2 = extra
+        return (
+            a1 * a2 + c1 * b2,
+            b1 * a2 + d1 * b2,
+            a1 * c2 + c1 * d2,
+            b1 * c2 + d1 * d2,
+            a1 * e2 + c1 * f2 + e1,
+            b1 * e2 + d1 * f2 + f1,
+        )
+
+    def _apply_transform(
+        self,
+        transform: Tuple[float, float, float, float, float, float],
+        x: float,
+        y: float,
+    ) -> Tuple[float, float]:
+        a, b, c, d, e, f = transform
+        return (a * x + c * y + e, b * x + d * y + f)
+
+    def _parse_svg_transform(self, transform_text: str) -> Tuple[float, float, float, float, float, float]:
+        transform_text = transform_text.strip()
+        if not transform_text:
+            return self._identity_transform()
+        pattern_re = re.compile(r"([a-zA-Z]+)\s*\(([^)]*)\)")
+        result = self._identity_transform()
+        for name, args_text in pattern_re.findall(transform_text):
+            params = [
+                float(p)
+                for p in re.split(r"[,\s]+", args_text.strip())
+                if p.strip()
+            ]
+            name = name.lower()
+            if name == "translate":
+                tx = params[0] if params else 0.0
+                ty = params[1] if len(params) > 1 else 0.0
+                matrix = (1.0, 0.0, 0.0, 1.0, tx, ty)
+            elif name == "scale":
+                sx = params[0] if params else 1.0
+                sy = params[1] if len(params) > 1 else sx
+                matrix = (sx, 0.0, 0.0, sy, 0.0, 0.0)
+            elif name == "rotate":
+                angle = params[0] if params else 0.0
+                rad = math.radians(angle)
+                cos_a = math.cos(rad)
+                sin_a = math.sin(rad)
+                if len(params) >= 3:
+                    cx, cy = params[1], params[2]
+                    matrix = self._combine_transform(
+                        self._combine_transform(
+                            (1.0, 0.0, 0.0, 1.0, cx, cy),
+                            (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0),
+                        ),
+                        (1.0, 0.0, 0.0, 1.0, -cx, -cy),
+                    )
+                else:
+                    matrix = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+            elif name == "skewx":
+                angle = params[0] if params else 0.0
+                matrix = (1.0, 0.0, math.tan(math.radians(angle)), 1.0, 0.0, 0.0)
+            elif name == "skewy":
+                angle = params[0] if params else 0.0
+                matrix = (1.0, math.tan(math.radians(angle)), 0.0, 1.0, 0.0, 0.0)
+            elif name == "matrix" and len(params) >= 6:
+                matrix = tuple(params[:6])  # type: ignore
+            else:
+                matrix = self._identity_transform()
+            result = self._combine_transform(result, matrix)
+        return result
 
     # ------------------------------------------------------------------
     # Status area
     # ------------------------------------------------------------------
     def _build_status_area(self) -> None:
-        with ui.card().classes("w-full p-4 gap-4"):
-            ui.label("Selection").classes("text-base font-medium")
-            self.selection_label = ui.label("")
-            ui.label("Status").classes("text-base font-medium")
-            self.status_log = ui.log(max_lines=200)
+        with ui.card().classes("w-full p-3 gap-2"):
+            ui.label("Selection").classes("text-sm font-medium")
+            self.selection_label = ui.label("").classes("text-xs")
+            ui.label("Status").classes("text-sm font-medium")
+            self.status_log = ui.log(max_lines=200).classes("text-xs")
             for line in self.state.status_lines:
                 self.status_log.push(line)
         self._update_selection_label()
@@ -803,8 +2960,40 @@ class PlotterApp:
 
     def _log_status(self, message: str) -> None:
         self.state.log(message)
-        if self.status_log is not None:
-            self.status_log.push(message)
+        self._update_status_panels()
+
+    def _update_status_panels(self) -> None:
+        if self.status_summary_label is not None:
+            device = self.state.serial_device or "COM3"
+            x, y, z = self._current_position()
+            progress_text = "Idle"
+            if self.progress is not None and self.progress.value and self.progress.value > 0.0:
+                progress_text = f"Running ({self.progress.value * 100:.0f}%)"
+            summary = (
+                f"Connected | {device} @ 115200 | X={x:.1f} | Y={y:.1f} | Z={z:.2f} | {progress_text}"
+            )
+            self.status_summary_label.set_text(summary)
+        if self.recent_status_container is not None:
+            self.recent_status_container.clear()
+            recent = self.state.status_lines[-3:]
+            with self.recent_status_container:
+                for entry in recent:
+                    ui.label(entry).classes("text-xs text-gray-700")
+
+    def _current_position(self) -> Tuple[float, float, float]:
+        entity = self.state.selected_entity
+        if entity:
+            kind, key = entity
+            if kind == "corner" and key in {"BL", "BR", "TL", "TR"}:
+                x, y = self._corner_world_coords(key)
+                z = self.state.corner_heights.get(str(key), self.state.z_height)
+                return x, y, z
+            if kind == "pot":
+                pot = next((p for p in self.state.pots if p.identifier == key), None)
+                if pot:
+                    x, y = pot.position
+                    return x, y, pot.height
+        return 0.0, 0.0, self.state.z_height
 
     def _update_area_label(self) -> None:
         if self.area_label is None:
@@ -839,10 +3028,7 @@ class PlotterApp:
             )
         else:
             self.selection_label.text = "No selection"
-
-    def _on_workpiece_change(self, e: events.ValueChangeEventArguments) -> None:
-        self.state.workpiece = e.value
-        self._notify(f"Workpiece changed to {e.value}.")
+        self._update_status_panels()
 
     def _on_height_change(self, e: events.ValueChangeEventArguments) -> None:
         if self._suppress_height_event:
@@ -856,6 +3042,7 @@ class PlotterApp:
                 corner_key = str(key)
                 self.state.corner_heights[corner_key] = height
                 self._log_status(f"Set corner {corner_key} height to {height:.2f}.")
+                self._sync_grbl_compensation()
             elif kind == "pot":
                 pot = next((p for p in self.state.pots if p.identifier == int(key)), None)
                 if pot:
@@ -864,11 +3051,9 @@ class PlotterApp:
                     self._refresh_pots(selected_id=pot.identifier)
         self._update_selection_label()
         self._update_canvas()
+        self._schedule_pen_height(height)
 
     def _quick_size(self, size: str) -> None:
-        self.state.workpiece = size
-        if self.workpiece_select is not None:
-            self.workpiece_select.value = size
         presets = {
             "A4": (297.0, 210.0),
             "A5": (210.0, 148.0),
@@ -882,9 +3067,26 @@ class PlotterApp:
         min_y = 0.0
         self.state.rect_min = (min_x, min_y)
         self.state.rect_max = (min_x + width, min_y + height)
+        self._sync_grbl_compensation()
         self._update_canvas()
         self._update_selection_label()
         self._log_status(f"Configured work area preset: {size} ({width:.0f} × {height:.0f} mm).")
+
+    def _reset_all_z_heights(self) -> None:
+        for key in self.state.corner_heights:
+            self.state.corner_heights[key] = 1.0
+        for pot in self.state.pots:
+            pot.height = 1.0
+        self.state.z_height = 1.0
+        if self.z_slider is not None:
+            try:
+                self._suppress_height_event = True
+                self.z_slider.value = 1.0
+            finally:
+                self._suppress_height_event = False
+        self._update_selection_label()
+        self._update_canvas()
+        self._log_status("Reset all Z heights to 1.0")
 
     def _add_pot(self) -> None:
         base_color = "#3a86ff"
@@ -950,13 +3152,9 @@ class PlotterApp:
     def _refresh_pots(self, selected_id: Optional[int] = None) -> None:
         if self.pot_select is None:
             return
-        options = [
-            {
-                "label": f"Pot #{p.identifier} (Z {p.height:.2f})",
-                "value": str(p.identifier),
-            }
-            for p in self.state.pots
-        ]
+        options = {
+            f"Pot #{p.identifier} (Z {p.height:.2f})": str(p.identifier) for p in self.state.pots
+        }
         self.pot_select.options = options
         valid_ids = {p.identifier for p in self.state.pots}
         if selected_id is not None:
@@ -988,6 +3186,7 @@ def _parse_bed_size(value: str) -> Tuple[float, float]:
     return width, height
 
 
+@ui.page("/")
 def main_page() -> None:
     """Instantiate and render the plotter application for the active client."""
     serial_device = APP_CONFIG.get("serial_device")
@@ -1024,6 +3223,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    ui.page("/")(main_page)
-
-    ui.run(title="Pen Plotter Control Suite", show=False)
+    ui.run(title="Pen Plotter Control Suite", show=False, reload=True)
