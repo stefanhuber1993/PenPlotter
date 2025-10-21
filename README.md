@@ -38,7 +38,7 @@ python nicegui_app.py \
   --area-size 300x245
 ```
 
-Open the printed `http://127.0.0.1:PORT` link in your browser.
+Open the printed `http://localhost:8080` link in your browser.
 
 **Typical workflow**
 - Drop SVG files onto the `Load` tab to queue them for plotting — this is the default path for artwork produced by the notebooks.
