@@ -2,8 +2,6 @@
 
 Modern tooling for experimenting with pen plotter hardware, pattern generation, and GRBL-based execution.
 
-> Replace `docs/images/ui.png` with an actual screenshot of the NiceGUI interface when you have one.
-
 ![Pen Plotter UI Placeholder](docs/images/ui.png)
 
 ## Overview
@@ -67,14 +65,16 @@ Apply helpers such as `Pattern.optimize_order_nn`, `resample_polylines`, and `co
 
 ## Patterns & Notebooks
 
-Notebooks in `patterns/` explore double pendulums, ray tracing, handwriting synthesis, moiré fields, and more. Each notebook exports SVGs into its folder; load them into the GUI or stream them directly with the renderer. If you dive into `patterns/pytorch-handwriting-synthesis-toolkit/`, follow that subproject’s instructions for extra dependencies.
+Notebooks in `patterns/` explore double pendulums, ray tracing, handwriting synthesis, moiré fields, and more. Each notebook exports SVGs into its folder; load them into the GUI or stream them directly with the renderer.
 
 ## Troubleshooting
 
 - macOS serial ports appear under `/dev/tty.usb*`; Linux typically uses `/dev/ttyUSB*`. Run `python -m serial.tools.list_ports` to discover devices.
 - The GUI sets `MPLCONFIGDIR` to `.matplotlib_cache/` to avoid permission issues; keep the directory writable.
 - Always validate new tool paths with the pen lifted and keep the pause/cancel controls handy for untrusted SVGs.
+- Make sure to set the total area-size to the correct value for your plotter.
 
 ## License
 
-Document the license terms that apply to your project here (for example, MIT, Apache 2.0, or proprietary). Update this section before publishing.
+This project is licensed under the MIT License.  
+See the [LICENSE](LICENSE) file for details.
