@@ -37,7 +37,6 @@ Python 3.10+ is recommended. The app works without a connected plotter, so you c
 
 ```bash
 python nicegui_app.py \
-  --serial-device /dev/tty.usbserial-A50285BI \
   --area-size 300x245
 ```
 
