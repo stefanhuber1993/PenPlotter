@@ -2,8 +2,6 @@
 
 Modern tooling tuned for the [LY Drawbot](https://nl.aliexpress.com/item/32967477326.html?gatewayAdapt=glo2nld) AliExpress pen plotter, built around GRBL control, servo-based pen lift, and four-corner bed compensation.
 
-> Replace `docs/images/ui.png` with an actual screenshot of the NiceGUI interface when you have one.
-
 ![Pen Plotter UI Placeholder](docs/images/ui.png)
 
 ## Overview
