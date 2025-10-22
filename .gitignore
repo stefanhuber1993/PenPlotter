@@ -3,3 +3,5 @@ stefanNina.png
 __pycache__/
 .github/
 .DS_Store
+external/
+artifacts/
