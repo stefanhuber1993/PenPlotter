@@ -3528,4 +3528,4 @@ if __name__ in {"__main__", "__mp_main__"}:
     os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    ui.run(title="Pen Plotter Control Suite", show=False, reload=True)
+    ui.run(title="Pen Plotter Control Suite", show=True, reload=True)
