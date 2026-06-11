@@ -119,6 +119,7 @@ class GRBL:
         self.cfg = cfg
         self.ser: Optional[serial.Serial] = None
         self._pen_pos: float = 1.0  # track last commanded position [0..1], default up
+        self._last_servo: Optional[int] = None  # last servo value actually sent
         self._comp: Optional[Compensation] = None
 
     # -------- Connection / basic I/O --------
@@ -272,7 +273,13 @@ class GRBL:
 
     def _issue_servo(self, pos: float):
         s = self._servo_map(pos)
+        # Skip redundant spindle commands: an unchanged M3 S value still forces
+        # GRBL to sync (stop motion) on spindle changes outside laser mode, so
+        # not re-sending the same value avoids stuttering along a stroke.
+        if s == self._last_servo:
+            return
         self.cmd(f"M3 S{s}", wait_ok=True)
+        self._last_servo = s
 
     def pen_set(self, pos: float, *, step: Optional[float] = None, step_delay_s: float = 0.03, wait: bool = False):
         """

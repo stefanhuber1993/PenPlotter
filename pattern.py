@@ -106,8 +106,16 @@ class Pattern:
                 lines.append(f"UNEXPECTED {type(it).__name__}")
         return "\n".join(lines)
 
-    def optimize_order_nn(self, start_xy: XY = (0.0, 0.0)) -> None:
-        remaining = list(self.items)
+    @staticmethod
+    def _order_items_nn(items: List[Item], start_xy: XY,
+                        allow_reverse: bool = True) -> Tuple[List[Item], XY]:
+        """Greedy nearest-neighbour ordering of a list of items.
+
+        Mutates each item's ``_rev`` flag (only when ``allow_reverse``) and
+        returns the ordered list together with the position of the last
+        endpoint, so callers can chain several runs together.
+        """
+        remaining = list(items)
         ordered: List[Item] = []
         cur = start_xy
 
@@ -119,16 +127,126 @@ class Pattern:
             for i, it in enumerate(remaining):
                 s0, e0 = it.endpoints()
                 d_fwd = dist(cur, s0)
-                d_rev = dist(cur, e0)
-                cost, cfg = (d_fwd, False) if d_fwd <= d_rev else (d_rev, True)
+                if allow_reverse:
+                    d_rev = dist(cur, e0)
+                    cost, cfg = (d_fwd, False) if d_fwd <= d_rev else (d_rev, True)
+                else:
+                    cost, cfg = d_fwd, it._rev
                 if cost < best_cost:
                     best_i, best_cost, best_cfg = i, cost, cfg
             it = remaining.pop(best_i)  # type: ignore
-            it._rev = bool(best_cfg)
+            if allow_reverse:
+                it._rev = bool(best_cfg)
             _, e = it.endpoints()
             cur = e
             ordered.append(it)
+        return ordered, cur
+
+    def optimize_order_nn(self, start_xy: XY = (0.0, 0.0),
+                          allow_reverse: bool = True) -> None:
+        self.items, _ = self._order_items_nn(self.items, start_xy, allow_reverse)
+
+    def bounds(self) -> Optional[Tuple[float, float, float, float]]:
+        """Axis-aligned bounding box (min_x, min_y, max_x, max_y) over all points."""
+        xs: List[float] = []
+        ys: List[float] = []
+        for it in self.items:
+            if isinstance(it, Polyline):
+                for x, y in it.pts:
+                    xs.append(x); ys.append(y)
+        if not xs:
+            return None
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    @staticmethod
+    def _item_center(it: Item) -> XY:
+        if isinstance(it, Polyline) and it.pts:
+            n = len(it.pts)
+            return (sum(p[0] for p in it.pts) / n, sum(p[1] for p in it.pts) / n)
+        s, e = it.endpoints()
+        return (0.5 * (s[0] + e[0]), 0.5 * (s[1] + e[1]))
+
+    def optimize_order_tiled(self, grid_n: int, start_xy: XY = (0.0, 0.0),
+                             allow_reverse: bool = True,
+                             serpentine: bool = True) -> None:
+        """Locally optimise travel within a ``grid_n`` x ``grid_n`` tiling.
+
+        Each item is assigned to the tile containing its centroid. Tiles are
+        visited row by row (bottom to top), left to right; when ``serpentine``
+        the row direction alternates to avoid a long jump back at every row.
+        Items inside each tile are nearest-neighbour ordered, chaining the pen
+        position from one tile to the next.
+        """
+        grid_n = int(max(1, grid_n))
+        if grid_n <= 1:
+            self.optimize_order_nn(start_xy, allow_reverse=allow_reverse)
+            return
+        bbox = self.bounds()
+        if bbox is None:
+            return
+        min_x, min_y, max_x, max_y = bbox
+        span_x = max(1e-9, max_x - min_x)
+        span_y = max(1e-9, max_y - min_y)
+
+        def tile_of(it: Item) -> Tuple[int, int]:
+            cx, cy = self._item_center(it)
+            col = int((cx - min_x) / span_x * grid_n)
+            row = int((cy - min_y) / span_y * grid_n)
+            col = min(grid_n - 1, max(0, col))
+            row = min(grid_n - 1, max(0, row))
+            return (col, row)
+
+        buckets: dict = {}
+        for it in self.items:
+            buckets.setdefault(tile_of(it), []).append(it)
+
+        ordered: List[Item] = []
+        cur = start_xy
+        for row in range(grid_n):
+            cols = range(grid_n)
+            if serpentine and row % 2 == 1:
+                cols = reversed(range(grid_n))
+            for col in cols:
+                tile_items = buckets.get((col, row))
+                if not tile_items:
+                    continue
+                tile_ordered, cur = self._order_items_nn(tile_items, cur, allow_reverse)
+                ordered.extend(tile_ordered)
         self.items = ordered
+
+    def apply_hatch_orientation(self, mode: str) -> str:
+        """Control the drawing orientation of each stroke.
+
+        mode:
+          'optimize' - leave the per-item ``_rev`` flags as chosen by ordering
+                       (strokes may be reversed to minimise travel).
+          'keep'     - draw every stroke in its original orientation (no flip).
+          'directional' - flip strokes so parallel lines are drawn the same way
+                          (left to right; bottom to top for vertical lines).
+        """
+        if mode == "optimize":
+            return "Hatch orientation: optimize (reversals allowed)."
+        if mode == "keep":
+            for it in self.items:
+                it._rev = False
+            return "Hatch orientation: keep original direction."
+        if mode == "directional":
+            flipped = 0
+            for it in self.items:
+                # raw (unreversed) endpoints define the geometric direction
+                if isinstance(it, Polyline) and it.pts:
+                    s, e = it.pts[0], it.pts[-1]
+                else:
+                    s, e = it.endpoints()
+                dx = e[0] - s[0]
+                dy = e[1] - s[1]
+                # want each stroke to run left->right; ties resolved bottom->top
+                want_rev = (dx < -1e-9) or (abs(dx) <= 1e-9 and dy < -1e-9)
+                if want_rev != it._rev:
+                    flipped += 1
+                it._rev = want_rev
+            return f"Hatch orientation: directional, flipped {flipped} strokes."
+        return f"Hatch orientation: unknown mode '{mode}', left unchanged."
 
     # -------- Pattern-level resampling and combining --------
 
@@ -266,6 +384,49 @@ def _resample_polyline_pts(pts: List[XY], *, max_dev_mm: Optional[float], max_se
         out = _split_long(out, max_seg_mm)
     return out
 
+def estimate_run_time(items: Iterable["Polyline"], start_xy: XY, *,
+                      feed_draw: float, feed_travel: float,
+                      settle_per_stroke: float = 0.0,
+                      default_feed_draw: Optional[float] = None) -> dict:
+    """Estimate draw/travel length and wall-clock time for a list of polylines.
+
+    Travel is measured in the given item order (this matches execution once the
+    pattern has been ordered; before ordering it is an approximation). Per-item
+    ``feed_draw`` overrides the default when present.
+    """
+    feed_travel = max(1.0, float(feed_travel))
+    base_draw = float(feed_draw if feed_draw else (default_feed_draw or 1.0)) or 1.0
+    draw_len = 0.0
+    travel_len = 0.0
+    draw_time = 0.0
+    strokes = 0
+    cur = start_xy
+    for it in items:
+        if not isinstance(it, Polyline):
+            continue
+        pts = list(reversed(it.pts)) if it._rev else list(it.pts)
+        if len(pts) < 2:
+            continue
+        strokes += 1
+        travel_len += math.hypot(pts[0][0] - cur[0], pts[0][1] - cur[1])
+        seg_len = 0.0
+        for a, b in zip(pts, pts[1:]):
+            seg_len += math.hypot(b[0] - a[0], b[1] - a[1])
+        draw_len += seg_len
+        fd = it.feed_draw if (it.feed_draw and it.feed_draw > 0) else base_draw
+        draw_time += (seg_len / max(1.0, fd)) * 60.0
+        cur = pts[-1]
+    travel_time = (travel_len / feed_travel) * 60.0
+    time_s = draw_time + travel_time + settle_per_stroke * strokes
+    return {
+        'draw_len': draw_len,
+        'travel_len': travel_len,
+        'total_len': draw_len + travel_len,
+        'time_s': time_s,
+        'strokes': strokes,
+        'end_xy': cur,
+    }
+
 # ------------------------------ Renderer ---------------------------------
 
 DEFAULT_PEN_COLORS = {
@@ -329,6 +490,13 @@ class Renderer:
         self.default_feed_draw = int(default_feed_draw) if default_feed_draw is not None else None
         self.default_pen_pressure = float(default_pen_pressure)
 
+        # ---- progress tracking (read by the UI while running) ----
+        self._prog_total_len = 0.0      # total path length to cover (mm)
+        self._prog_done_len = 0.0       # path length covered so far (mm)
+        self._prog_start_t: Optional[float] = None
+        self._est_total_s = 0.0         # static up-front time estimate (s)
+        self._finished = False
+
     # ------------------------------ Public API ----------------------------
 
     def attach_widget_api(self, api: dict) -> None:
@@ -358,22 +526,31 @@ class Renderer:
     def reset_control(self) -> None:
         self._cancel_requested = False
         self._pause_event.set()
+        self._finished = False
 
-    def request_cancel(self) -> None:
-        self._cancel_requested = True
-        self._pause_event.set()
+    def _send_rt(self, byte: bytes) -> None:
+        """Send a single GRBL real-time byte (safe from any thread)."""
         try:
-            if getattr(self.g, 'ser', None):
-                self.g.ser.write(b'!')
-                self.g.ser.flush()
+            ser = getattr(self.g, 'ser', None)
+            if ser is not None:
+                ser.write(byte)
+                ser.flush()
         except Exception:
             pass
 
+    def request_cancel(self) -> None:
+        # Flag first so the worker stops streaming, then hold motion immediately.
+        self._cancel_requested = True
+        self._pause_event.set()  # release a paused worker so it can observe cancel
+        self._send_rt(b'!')      # feed hold: stop motion now; buffer flushed on abort
+
     def request_pause(self) -> None:
         self._pause_event.clear()
+        self._send_rt(b'!')      # feed hold
 
     def request_resume(self) -> None:
         if not self._pause_event.is_set():
+            self._send_rt(b'~')  # cycle start / resume
             self._pause_event.set()
 
     def _wait_if_paused(self) -> None:
@@ -382,6 +559,116 @@ class Renderer:
     def _check_cancelled(self) -> None:
         if self._cancel_requested:
             raise RendererCancelled()
+
+    def _wait_idle(self, timeout: float = 120.0) -> None:
+        """Block until GRBL is idle, staying responsive to pause and cancel.
+
+        Unlike ``GRBL.wait_idle`` this never spins out while the machine is in
+        feed-hold for a pause, and it raises promptly when a cancel is
+        requested instead of timing out.
+        """
+        t0 = time.time()
+        while True:
+            self._check_cancelled()
+            if not self._pause_event.is_set():
+                self._wait_if_paused()   # block here while paused
+                t0 = time.time()         # don't count paused time toward timeout
+                self._check_cancelled()
+            try:
+                if self.g.is_idle():
+                    return
+            except Exception:
+                pass
+            if time.time() - t0 > timeout:
+                raise TimeoutError("GRBL did not become IDLE in time.")
+            time.sleep(0.05)
+
+    def _abort_and_park(self) -> None:
+        """Cleanly stop a cancelled job: halt motion, flush GRBL's buffer,
+        lift the pen and restore the work origin."""
+        g = self.g
+        try:
+            self._send_rt(b'!')          # ensure feed hold
+            time.sleep(0.3)              # let motion decelerate to a stop
+            wpos = None
+            try:
+                wpos = g.status().get('wpos')
+            except Exception:
+                wpos = None
+            # soft reset clears the planner buffer so queued moves don't resume
+            self._send_rt(b'\x18')
+            time.sleep(0.4)
+            try:
+                g.flush_input()
+            except Exception:
+                pass
+            try:
+                g.cmd('G90'); g.cmd('G21')
+            except Exception:
+                pass
+            # reset pen tracking and lift the pen off the paper
+            try:
+                g._pen_pos = 1.0
+                g._last_servo = None
+                g.pen_set(1.0, wait=False)
+            except Exception:
+                pass
+            # restore the work origin (machine position is retained across reset)
+            if wpos is not None and len(wpos) >= 2:
+                try:
+                    g.cmd(f'G92 X{wpos[0]:.3f} Y{wpos[1]:.3f}')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ------------------------------ Progress ------------------------------
+
+    def _advance_progress(self, dist: float) -> None:
+        if dist > 0:
+            self._prog_done_len += dist
+
+    def progress_snapshot(self) -> dict:
+        """Thread-safe-ish snapshot for the UI: fraction done, elapsed, ETA."""
+        total = self._prog_total_len
+        done = self._prog_done_len
+        frac = min(1.0, done / total) if total > 0 else 0.0
+        elapsed = (time.time() - self._prog_start_t) if self._prog_start_t else 0.0
+        if self._finished:
+            frac = 1.0
+            remaining = 0.0
+            est_total = elapsed
+        elif frac > 0.03 and elapsed > 0.5:
+            est_total = elapsed / frac
+            remaining = max(0.0, est_total - elapsed)
+        else:
+            est_total = max(self._est_total_s, elapsed)
+            remaining = max(0.0, est_total - elapsed)
+        return {
+            'fraction': frac,
+            'elapsed_s': elapsed,
+            'remaining_s': remaining,
+            'est_total_s': est_total,
+            'done_mm': done,
+            'total_mm': total,
+            'finished': self._finished,
+        }
+
+    def _estimate_totals(self, exec_items: List['Polyline'], start_xy: XY) -> None:
+        """Pre-compute total path length and a static time estimate."""
+        cfg_draw = getattr(self.g.cfg, 'feed_draw', None) if hasattr(self.g, 'cfg') else None
+        cfg_travel = getattr(self.g.cfg, 'feed_travel', None) if hasattr(self.g, 'cfg') else None
+        feed_draw = self.default_feed_draw or cfg_draw or 3000
+        feed_travel = self.feed_travel or cfg_travel or 3000
+        est = estimate_run_time(
+            exec_items, start_xy,
+            feed_draw=feed_draw, feed_travel=feed_travel,
+            settle_per_stroke=(self.settle_down_s + self.settle_up_s),
+            default_feed_draw=feed_draw,
+        )
+        self._prog_total_len = est['total_len']
+        self._prog_done_len = 0.0
+        self._est_total_s = est['time_s']
 
     def plot(self, pattern: Pattern, *, pens: Optional[Union[int, Iterable[int]]] = None,
              width: float = 1.5) -> None:
@@ -439,7 +726,9 @@ class Renderer:
 
     def run(self, pattern: Pattern, *,
             start_xy: XY = (0.0, 0.0),
-            optimize: Optional[str] = None,    # 'nn' or None
+            optimize: Optional[str] = None,    # 'nn', 'tiled' or None
+            tile_grid: int = 4,                # tiling for optimize='tiled'
+            hatch_orient: str = 'optimize',    # 'optimize' | 'directional' | 'keep'
             resample: Optional[dict] = None,   # {'max_dev_mm':..., 'max_seg_mm':...}
             combine: Optional[dict] = None,    # {'join_tol_mm':...}
             return_home: bool = True,
@@ -461,13 +750,26 @@ class Renderer:
                                              max_seg_mm=resample.get('max_seg_mm', None))
             print(msg)
 
-        if optimize == 'nn':
+        # 'directional' / 'keep' force a fixed orientation, so ordering must not
+        # be allowed to flip strokes; 'optimize' lets the orderer reverse them.
+        allow_reverse = (hatch_orient == 'optimize')
+
+        if optimize in ('nn', 'tiled'):
             before = self._travel_estimate(pattern, start_xy)
-            pattern.optimize_order_nn(start_xy=start_xy)
+            if optimize == 'tiled':
+                pattern.optimize_order_tiled(int(tile_grid), start_xy=start_xy,
+                                             allow_reverse=allow_reverse)
+            else:
+                pattern.optimize_order_nn(start_xy=start_xy, allow_reverse=allow_reverse)
             after = self._travel_estimate(pattern, start_xy)
             gain = max(0.0, before - after)
             pct = (gain / before * 100.0) if before > 0 else 0.0
-            print(f"Optimize order: nn, travel {before:.2f} -> {after:.2f} mm, saved {gain:.2f} mm ({pct:.1f} percent).")
+            label = f"tiled({tile_grid}x{tile_grid})" if optimize == 'tiled' else 'nn'
+            print(f"Optimize order: {label}, travel {before:.2f} -> {after:.2f} mm, "
+                  f"saved {gain:.2f} mm ({pct:.1f} percent).")
+
+        if hatch_orient in ('directional', 'keep'):
+            print(pattern.apply_hatch_orientation(hatch_orient))
 
         if preview_in_widget:
             self.plot(pattern, pens=pen_filter)
@@ -484,25 +786,37 @@ class Renderer:
             else:
                 raise TypeError(f"Unsupported item at execution: {type(it).__name__}")
 
+        # progress bookkeeping
+        self._estimate_totals(exec_items, start_xy)
+        self._prog_start_t = time.time()
+        self._finished = False
+
+        # Keep the pen fully up from start until the first point to plot: we do
+        # NOT pre-travel to start_xy (that only seeds the order optimiser). The
+        # first stroke's travel handles lifting and moving with the pen up.
         self._cur_xy = None
-        self._check_cancelled()
-        self._wait_if_paused()
-        self._travel_to(start_xy[0], start_xy[1])
 
-        for it in exec_items:
-            self._check_cancelled()
-            self._wait_if_paused()
-            self._run_polyline(it)
+        try:
+            for it in exec_items:
+                self._check_cancelled()
+                self._wait_if_paused()
+                self._run_polyline(it)
 
-        if return_home:
-            self._check_cancelled()
-            self._wait_if_paused()
-            self._pen_set(1.0, settle=False)
-            if self.settle_up_s > 0:
-                time.sleep(self.settle_up_s)
-            self._travel_to(0.0, 0.0)
-            self._pen_set(1.0, settle=False)
-            self._cur_xy = (0.0, 0.0)
+            if return_home:
+                self._check_cancelled()
+                self._wait_if_paused()
+                self._pen_set(1.0, settle=False)
+                if self.settle_up_s > 0:
+                    time.sleep(self.settle_up_s)
+                self._travel_to(0.0, 0.0)
+                self._pen_set(1.0, settle=False)
+                self._cur_xy = (0.0, 0.0)
+        except RendererCancelled:
+            self._abort_and_park()
+            raise
+
+        self._prog_done_len = self._prog_total_len
+        self._finished = True
 
     # ------------------------------ runners ------------------------------
 
@@ -543,10 +857,11 @@ class Renderer:
             for i in range(1, len(pts)):
                 self._check_cancelled()
                 self._wait_if_paused()
-                ex, ey = pts[i]
+                sx, sy = pts[i - 1]; ex, ey = pts[i]
                 self.g.draw_xy(ex, ey, wait=False)
+                self._advance_progress(math.hypot(ex - sx, ey - sy))
                 if i % self.flush_every == 0:
-                    self.g.wait_idle()
+                    self._wait_idle()
 
         elif self.z_mode == "per_segment":
             sx, sy = pts[0]
@@ -562,8 +877,9 @@ class Renderer:
                 self._wait_if_paused()
                 self._pen_set(z, settle=False)
                 self.g.draw_xy(ex, ey, wait=False)
+                self._advance_progress(math.hypot(ex - sx, ey - sy))
                 if i % self.flush_every == 0:
-                    self.g.wait_idle()
+                    self._wait_idle()
 
         elif self.z_mode == "threshold":
             sx, sy = pts[0]
@@ -581,12 +897,13 @@ class Renderer:
                     self._pen_set(z, settle=False)
                     cur_z = z
                 self.g.draw_xy(ex, ey, wait=False)
+                self._advance_progress(math.hypot(ex - sx, ey - sy))
                 if i % self.flush_every == 0:
-                    self.g.wait_idle()
+                    self._wait_idle()
         else:
             raise ValueError(f"Unknown z_mode: {self.z_mode}")
 
-        self.g.wait_idle()
+        self._wait_idle()
         self._partial_lift_to_travel(pts[-1])
         self._cur_xy = pts[-1]
 
@@ -621,11 +938,14 @@ class Renderer:
         feed = self.feed_travel if self.feed_travel is not None else getattr(self.g.cfg, "feed_travel", None)
         if self._cur_xy is not None:
             self._partial_lift_to_travel(self._cur_xy)
+            self._advance_progress(math.hypot(x - self._cur_xy[0], y - self._cur_xy[1]))
         else:
+            # very first move of the job: lift the pen fully before travelling
             self.g.pen_set(1.0, step=self.z_step, step_delay_s=self.z_step_delay, wait=False)
             if self.settle_up_s > 0:
                 time.sleep(self.settle_up_s)
-        self.g.move_xy(x, y, feed=feed, wait=True)
+        self.g.move_xy(x, y, feed=feed, wait=False)
+        self._wait_idle()
         self._cur_xy = (x, y)
 
     def _travel_estimate(self, pattern: Pattern, start_xy: XY) -> float:

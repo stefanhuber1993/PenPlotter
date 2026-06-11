@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 
 from nicegui import events, ui
 
-from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS, Renderer, RendererCancelled
+from pattern import Circle, Line, Pattern, Polyline, DEFAULT_PEN_COLORS, Renderer, RendererCancelled, estimate_run_time
 from penplot_helper import Config, GRBL, Compensation, Rect
 
 try:
@@ -91,6 +91,11 @@ class PlotterApp:
         self.progress = None
         self.pattern_display_width = 1.5
         self.progress_label = None
+        self.progress_pct_label = None
+        self.progress_elapsed_label = None
+        self.progress_eta_label = None
+        self.progress_remaining_label = None
+        self.eta_breakdown_container = None
         self.color_picker = None
         self.canvas = None
         self.canvas_element = None
@@ -124,6 +129,7 @@ class PlotterApp:
         self.comms_status_label = None
         self.comms_output = None
         self.gcode_input = None
+        self.grbl_ref_dialog = None
         self.comms_log_lines: List[str] = []
         self.grbl: Optional[GRBL] = None
         self.grbl_config = Config()
@@ -416,14 +422,131 @@ class PlotterApp:
             self.gcode_input = ui.textarea(
                 placeholder="Enter G-code commands..."
             ).props("autogrow rows=3 dense").classes("font-mono text-[12px]")
-            with ui.row().classes("gap-2 justify-end"):
+            with ui.row().classes("gap-2 justify-end items-center"):
+                ui.button(icon="help_outline", on_click=lambda: self.grbl_ref_dialog.open()) \
+                    .props("flat round size='sm' color=primary") \
+                    .tooltip("GRBL $-command reference")
                 ui.button("Send", color="primary", on_click=self._send_gcode_command).props("unelevated size='sm'")
                 ui.button("Clear Log", on_click=self._clear_comms_log).props("size='sm'")
+
+            self._build_grbl_reference_dialog()
 
         self._refresh_serial_ports()
         self._update_comms_log_display()
         self._update_comms_status()
         self._update_comms_buttons()
+
+    def _insert_terminal_command(self, command: str) -> None:
+        """Drop a command into the terminal input so the user can review /
+        complete it before sending. ``$N=`` settings keep the trailing ``=``
+        ready for a value."""
+        if self.gcode_input is not None:
+            self.gcode_input.set_value(command)
+            try:
+                self.gcode_input.run_method("focus")
+            except Exception:
+                pass
+        if self.grbl_ref_dialog is not None:
+            self.grbl_ref_dialog.close()
+
+    def _build_grbl_reference_dialog(self) -> None:
+        # (command, description). Click a row to load it into the terminal.
+        realtime = [
+            ("?", "Status query — current state and position (no Enter needed)."),
+            ("~", "Cycle start / resume from a feed hold."),
+            ("!", "Feed hold — decelerate and pause motion."),
+            ("Ctrl-X", "Soft reset — abort, clear the planner buffer, reboot GRBL."),
+        ]
+        system = [
+            ("$$", "View all settings and their current values."),
+            ("$#", "View work coordinate offsets (G54-G59, G92, TLO, probe)."),
+            ("$G", "View parser state (active G/M modal groups, feed, S)."),
+            ("$I", "View build info / firmware version."),
+            ("$N", "View startup blocks (G-code run on reset)."),
+            ("$H", "Run the homing cycle (requires limit switches)."),
+            ("$X", "Kill alarm lock — clear an alarm state."),
+            ("$C", "Toggle check-mode (parse G-code without moving)."),
+            ("$RST=$", "Restore all $ settings to defaults."),
+            ("$RST=#", "Erase work coordinate offsets / parameters."),
+            ("$RST=*", "Restore everything to defaults."),
+        ]
+        # (command-prefix, name, unit, description) — value typed after '='.
+        settings = [
+            ("$0=", "Step pulse", "µs", "Stepper pulse length."),
+            ("$1=", "Step idle delay", "ms", "Delay before motors disable (255 = always on)."),
+            ("$2=", "Step port invert", "mask", "Invert step signal per axis (bitmask)."),
+            ("$3=", "Direction invert", "mask", "Invert direction per axis — flips an axis."),
+            ("$4=", "Step enable invert", "bool", "Invert the stepper-enable pin."),
+            ("$5=", "Limit pins invert", "bool", "Invert limit switch logic."),
+            ("$6=", "Probe pin invert", "bool", "Invert probe pin logic."),
+            ("$10=", "Status report", "mask", "What ? reports (1=MPos, 2=WPos via WCO)."),
+            ("$11=", "Junction deviation", "mm", "Cornering speed — lower = sharper/slower."),
+            ("$12=", "Arc tolerance", "mm", "Chord error when rendering G2/G3 arcs."),
+            ("$13=", "Report inches", "bool", "0 = mm, 1 = inches."),
+            ("$20=", "Soft limits", "bool", "Refuse moves beyond $130-$132 travel."),
+            ("$21=", "Hard limits", "bool", "Stop on limit-switch trigger."),
+            ("$22=", "Homing cycle", "bool", "Enable homing (needs limit switches)."),
+            ("$23=", "Homing dir invert", "mask", "Which way each axis seeks home."),
+            ("$24=", "Homing feed", "mm/min", "Slow approach speed when locating switch."),
+            ("$25=", "Homing seek", "mm/min", "Fast seek speed toward the switch."),
+            ("$26=", "Homing debounce", "ms", "Switch debounce delay."),
+            ("$27=", "Homing pull-off", "mm", "Back-off distance after homing."),
+            ("$30=", "Max spindle speed", "RPM/S", "S value = full PWM. Pen servo: S for 'up'."),
+            ("$31=", "Min spindle speed", "RPM/S", "S value = minimum PWM."),
+            ("$32=", "Laser mode", "bool", "1 = dynamic S during motion (no stop). Note: "
+                                           "zeros PWM on G0 travel — usually keep 0 for a pen servo."),
+            ("$100=", "X steps/mm", "step/mm", "X resolution / calibration."),
+            ("$101=", "Y steps/mm", "step/mm", "Y resolution / calibration."),
+            ("$102=", "Z steps/mm", "step/mm", "Z resolution (if Z is a real axis)."),
+            ("$110=", "X max rate", "mm/min", "Max X feed (rapids)."),
+            ("$111=", "Y max rate", "mm/min", "Max Y feed (rapids)."),
+            ("$112=", "Z max rate", "mm/min", "Max Z feed."),
+            ("$120=", "X acceleration", "mm/s²", "X accel — higher = snappier, may skip steps."),
+            ("$121=", "Y acceleration", "mm/s²", "Y accel."),
+            ("$122=", "Z acceleration", "mm/s²", "Z accel."),
+            ("$130=", "X max travel", "mm", "X bed size (for soft limits)."),
+            ("$131=", "Y max travel", "mm", "Y bed size (for soft limits)."),
+            ("$132=", "Z max travel", "mm", "Z travel."),
+        ]
+
+        with ui.dialog() as dialog, ui.card().classes("w-[560px] max-w-[92vw] max-h-[85vh] overflow-y-auto gap-3 p-4"):
+            self.grbl_ref_dialog = dialog
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("GRBL command reference").classes("text-sm font-semibold")
+                ui.button(icon="close", on_click=dialog.close).props("flat round size='sm'")
+            ui.label("Click any command to drop it into the terminal input.").classes(
+                "text-[11px] text-gray-500"
+            )
+
+            def command_row(cmd: str, desc: str, *, mono_w: str = "w-16") -> None:
+                row = ui.row().classes(
+                    "items-start gap-2 w-full px-1 py-0.5 rounded cursor-pointer "
+                    "hover:bg-blue-50 transition-colors"
+                )
+                with row:
+                    ui.label(cmd).classes(f"font-mono text-[11px] text-blue-700 font-semibold {mono_w} shrink-0")
+                    ui.label(desc).classes("text-[11px] text-gray-600 leading-snug")
+                # 'Ctrl-X' is the soft-reset byte; everything else is sent as text.
+                payload = "\x18" if cmd == "Ctrl-X" else cmd
+                row.on("click", lambda _=None, c=payload: self._insert_terminal_command(c))
+
+            ui.label("Real-time (sent instantly, no Enter)").classes("text-[11px] font-medium text-gray-700 mt-1")
+            for cmd, desc in realtime:
+                command_row(cmd, desc)
+
+            ui.separator()
+            ui.label("System commands").classes("text-[11px] font-medium text-gray-700")
+            for cmd, desc in system:
+                command_row(cmd, desc)
+
+            ui.separator()
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("Settings — view all with $$, set with $N=value").classes(
+                    "text-[11px] font-medium text-gray-700"
+                )
+                ui.label("e.g. $100=80.000").classes("text-[10px] font-mono text-gray-400")
+            for prefix, name, unit, desc in settings:
+                command_row(prefix, f"{name} [{unit}] — {desc}", mono_w="w-16")
 
     def _refresh_serial_ports(self) -> None:
         if self.serial_select is None:
@@ -1435,14 +1558,36 @@ class PlotterApp:
 
                 with ui.column().classes("gap-2"):
                     ui.label("Optimization").classes("text-[11px] font-medium text-gray-600")
-                    self.cfg_nn_checkbox = ui.checkbox("Nearest-neighbour optimization", value=False).classes("text-[11px]")
+                    ui.label("Travel order").classes("text-[10px] text-gray-500")
+                    self.cfg_optimize_mode = ui.toggle(
+                        options={"none": "None", "nn": "Global NN", "tiled": "Tiled"},
+                        value="none",
+                    ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
+                    self.cfg_tile_grid = number_field(
+                        "Tile grid (NxN)",
+                        value=4.0,
+                        min_value=1.0,
+                        max_value=50.0,
+                        step=1.0,
+                        hint="Used with 'Tiled': paths are optimised per tile, "
+                             "tiles run row by row.",
+                    )
+                    ui.label("Hatch orientation").classes("text-[10px] text-gray-500")
+                    self.cfg_hatch_orient = ui.toggle(
+                        options={
+                            "optimize": "Optimize (flip ok)",
+                            "directional": "Directional",
+                            "keep": "Keep",
+                        },
+                        value="optimize",
+                    ).props("type=button dense toggle-color=primary").classes("w-full flex-wrap text-[10px]")
                     with ui.column().classes("gap-1 pl-2"):
                         self.cfg_start_x = number_field(
                             "Start X (mm)",
                             value=0.0,
                             min_value=0.0,
                             step=0.1,
-                            hint="Only applied when NN optimization is enabled.",
+                            hint="Start point used to seed travel optimization.",
                         )
                         self.cfg_start_y = number_field(
                             "Start Y (mm)",
@@ -1501,10 +1646,137 @@ class PlotterApp:
                 self.run_pause_button.disable()
                 self.run_stop_button.disable()
 
-            self.progress = ui.linear_progress(value=0.0).props("color=primary")
+            self.progress = ui.linear_progress(value=0.0, show_value=False).props("color=primary")
             self.progress_label = ui.label("Idle").classes("text-[11px]")
+            with ui.row().classes("w-full justify-between gap-2"):
+                self.progress_pct_label = ui.label("0%").classes("text-[11px] font-medium")
+                self.progress_elapsed_label = ui.label("Elapsed --:--").classes("text-[11px] text-gray-600")
+            with ui.row().classes("w-full justify-between gap-2"):
+                self.progress_eta_label = ui.label("Est --:--").classes("text-[11px] text-gray-600")
+                self.progress_remaining_label = ui.label("Remaining --:--").classes("text-[11px] text-gray-600")
+            self.eta_breakdown_container = ui.column().classes("w-full gap-0.5")
             self._update_pen_filter_options()
             self._update_run_buttons()
+            self._update_eta_breakdown()
+            ui.timer(0.4, self._poll_progress)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        try:
+            seconds = max(0, int(round(seconds)))
+        except (TypeError, ValueError):
+            return "--:--"
+        if seconds >= 3600:
+            h, rem = divmod(seconds, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h:d}:{m:02d}:{s:02d}"
+        m, s = divmod(seconds, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _poll_progress(self) -> None:
+        renderer = self.renderer
+        running = bool(self.run_task and not self.run_task.done())
+        if renderer is None or not running:
+            return
+        try:
+            snap = renderer.progress_snapshot()
+        except Exception:
+            return
+        frac = float(snap.get("fraction", 0.0))
+        if self.progress is not None:
+            self.progress.set_value(frac)
+        if self.progress_pct_label is not None:
+            self.progress_pct_label.set_text(f"{frac * 100:.0f}%")
+        if self.progress_elapsed_label is not None:
+            self.progress_elapsed_label.set_text(f"Elapsed {self._fmt_duration(snap.get('elapsed_s', 0.0))}")
+        if self.progress_eta_label is not None:
+            self.progress_eta_label.set_text(f"Est {self._fmt_duration(snap.get('est_total_s', 0.0))}")
+        if self.progress_remaining_label is not None:
+            self.progress_remaining_label.set_text(f"Remaining {self._fmt_duration(snap.get('remaining_s', 0.0))}")
+
+    def _eta_feeds(self) -> Tuple[float, float, float, Tuple[float, float]]:
+        """Resolve feeds / settle / start point used for the static ETA, from
+        the config fields (falling back to the connected GRBL config)."""
+        grbl_ready = self._is_grbl_ready()
+        draw = self._int_value(getattr(self, "cfg_default_feed_draw", None), None)
+        if not draw or draw <= 0:
+            draw = (getattr(self.grbl.cfg, "feed_draw", 3000) if grbl_ready else 3000) or 3000
+        travel = self._int_value(getattr(self, "cfg_travel_feed", None), None)
+        if not travel or travel <= 0:
+            travel = (getattr(self.grbl.cfg, "feed_travel", 3000) if grbl_ready else 3000) or 3000
+        settle = self._float_value(getattr(self, "cfg_settle_down", None), 0.0) \
+            + self._float_value(getattr(self, "cfg_settle_up", None), 0.0)
+        sx = self._float_value(getattr(self, "cfg_start_x", None), 0.0)
+        sy = self._float_value(getattr(self, "cfg_start_y", None), 0.0)
+        return float(draw), float(travel), float(settle), (sx, sy)
+
+    def _update_eta_breakdown(self) -> None:
+        """Render an up-front per-pen time estimate in the Run tab. Each pen is
+        estimated as its own filtered run (the pen-swap workflow). Hidden when
+        the pattern has zero or one colour."""
+        container = self.eta_breakdown_container
+        if container is None:
+            return
+        container.clear()
+        if not self.pattern.items:
+            return
+        groups: Dict[int, List[Polyline]] = {}
+        for it in self.pattern.items:
+            if isinstance(it, Polyline) and len(it.pts) >= 2:
+                groups.setdefault(int(getattr(it, "pen_id", 0)), []).append(it)
+        if len(groups) <= 1:
+            return  # single colour: the running ETA already covers it
+
+        draw, travel, settle, start_xy = self._eta_feeds()
+        per: Dict[int, dict] = {}
+        total_s = 0.0
+        for pid, items in groups.items():
+            est = estimate_run_time(
+                items, start_xy,
+                feed_draw=draw, feed_travel=travel,
+                settle_per_stroke=settle, default_feed_draw=draw,
+            )
+            per[pid] = est
+            total_s += est["time_s"]
+
+        selected = self.preview_pen_choice
+        sel_pid: Optional[int] = None
+        if selected not in (None, "", "all"):
+            try:
+                sel_pid = int(selected)
+            except (TypeError, ValueError):
+                sel_pid = None
+
+        with container:
+            ui.label("Estimated time per pen").classes(
+                "text-[10px] font-medium text-gray-500 uppercase tracking-wide mt-1"
+            )
+            for pid in sorted(per):
+                est = per[pid]
+                color = DEFAULT_PEN_COLORS.get(pid, DEFAULT_PEN_COLORS[0])
+                is_sel = (sel_pid == pid)
+                row_cls = "items-center gap-2 text-[11px]" + (" font-semibold" if is_sel else "")
+                with ui.row().classes(row_cls):
+                    ui.html(
+                        f'<span style="display:inline-block;width:10px;height:10px;'
+                        f'border-radius:2px;background:{color};"></span>'
+                    )
+                    ui.label(f"Pen {pid}")
+                    ui.space()
+                    ui.label(self._fmt_duration(est["time_s"]))
+                    ui.label(f"{est['total_len'] / 1000.0:.1f} m").classes("text-gray-400 w-12 text-right")
+            with ui.row().classes("items-center gap-2 text-[11px] font-medium border-t pt-1"):
+                ui.label("All pens")
+                ui.space()
+                ui.label(self._fmt_duration(total_s))
+            if sel_pid is not None and sel_pid in per:
+                ui.label(
+                    f"Selected: Pen {sel_pid} — {self._fmt_duration(per[sel_pid]['time_s'])}"
+                ).classes("text-[11px] text-primary")
+            else:
+                ui.label(
+                    f"Selected: All pens — {self._fmt_duration(total_s)}"
+                ).classes("text-[11px] text-primary")
 
     def _pen_ids_in_pattern(self) -> List[int]:
         pen_ids: set[int] = set()
@@ -1539,6 +1811,7 @@ class PlotterApp:
         label = (event.value or "All pens").strip()
         self.preview_pen_choice = self._value_from_pen_label(label)
         self._update_canvas()
+        self._update_eta_breakdown()
 
     def _float_value(self, control: Any, default: float) -> float:
         try:
@@ -1626,7 +1899,10 @@ class PlotterApp:
 
         start_x = self._float_value(self.cfg_start_x, 0.0)
         start_y = self._float_value(self.cfg_start_y, 0.0)
-        optimize = 'nn' if self.cfg_nn_checkbox and self.cfg_nn_checkbox.value else None
+        mode = self.cfg_optimize_mode.value if self.cfg_optimize_mode else "none"
+        optimize = None if mode in (None, "none") else mode
+        tile_grid = max(1, self._int_value(self.cfg_tile_grid, 4) or 4)
+        hatch_orient = self.cfg_hatch_orient.value if self.cfg_hatch_orient else "optimize"
 
         combine = None
         if self.cfg_combine_checkbox and self.cfg_combine_checkbox.value:
@@ -1668,6 +1944,8 @@ class PlotterApp:
             'default_pen_pressure': default_pen_pressure,
             'start_xy': (start_x, start_y),
             'optimize': optimize,
+            'tile_grid': tile_grid,
+            'hatch_orient': hatch_orient,
             'resample': resample,
             'combine': combine,
             'pen_filter': pen_filter,
@@ -1730,6 +2008,17 @@ class PlotterApp:
         self.run_paused = False
         if self.progress_label is not None:
             self.progress_label.set_text("Running...")
+        if self.progress is not None:
+            self.progress.set_value(0.0)
+        if self.progress_pct_label is not None:
+            self.progress_pct_label.set_text("0%")
+        for lbl, txt in (
+            (self.progress_elapsed_label, "Elapsed 00:00"),
+            (self.progress_eta_label, "Est --:--"),
+            (self.progress_remaining_label, "Remaining --:--"),
+        ):
+            if lbl is not None:
+                lbl.set_text(txt)
         self._update_run_buttons()
 
         async def runner() -> None:
@@ -1739,6 +2028,8 @@ class PlotterApp:
                     pattern_clone,
                     start_xy=settings['start_xy'],
                     optimize=settings['optimize'],
+                    tile_grid=settings['tile_grid'],
+                    hatch_orient=settings['hatch_orient'],
                     resample=settings['resample'],
                     combine=settings['combine'],
                     return_home=settings['return_home'],
@@ -1759,11 +2050,19 @@ class PlotterApp:
                     pass
             else:
                 self._append_comms_log("Plot completed.")
+                if self.progress is not None:
+                    self.progress.set_value(1.0)
+                if self.progress_pct_label is not None:
+                    self.progress_pct_label.set_text("100%")
+                if self.progress_remaining_label is not None:
+                    self.progress_remaining_label.set_text("Remaining 00:00")
+                if self.progress_label is not None:
+                    self.progress_label.set_text("Done")
             finally:
                 self.renderer = None
                 self.run_paused = False
                 self.run_task = None
-                if self.progress_label is not None:
+                if self.progress_label is not None and self.progress_label.text not in ("Done", "Cancelled"):
                     self.progress_label.set_text("Idle")
                 self._update_run_buttons()
 
@@ -1777,8 +2076,8 @@ class PlotterApp:
         if not self.renderer:
             return
         if not self.run_paused:
+            # request_pause() issues the GRBL feed-hold itself
             self.renderer.request_pause()
-            await self._send_feed_control(b'!', 'Feed hold (pause)')
             self.run_paused = True
             if self.run_pause_button is not None:
                 self.run_pause_button.set_text("Resume")
@@ -1786,8 +2085,8 @@ class PlotterApp:
                 self.progress_label.set_text("Paused")
             self._append_comms_log("Plot paused.")
         else:
+            # request_resume() issues the GRBL cycle-start itself
             self.renderer.request_resume()
-            await self._send_feed_control(b'~', 'Resume feed')
             self.run_paused = False
             if self.run_pause_button is not None:
                 self.run_pause_button.set_text("Pause")
@@ -1801,8 +2100,9 @@ class PlotterApp:
             ui.notify("No active plot to stop.", color="warning")
             return
         if self.renderer:
+            # request_cancel() feed-holds immediately; the worker then flushes
+            # GRBL's buffer, lifts the pen and restores the origin via abort.
             self.renderer.request_cancel()
-            await self._send_feed_control(b'~', 'Released feed hold')
         self._append_comms_log("Stop requested.")
         try:
             await self.run_task
@@ -1810,7 +2110,6 @@ class PlotterApp:
             self.run_task = None
             self.renderer = None
             self.run_paused = False
-            await self._send_feed_control(b'~', 'Ensured feed hold released')
             if self.progress_label is not None:
                 self.progress_label.set_text("Cancelled")
             self._update_run_buttons()
@@ -2027,6 +2326,7 @@ class PlotterApp:
         self._update_pattern_summary()
         self._update_pen_filter_options()
         self._update_canvas()
+        self._update_eta_breakdown()
         ui.notify("Pattern cleared.", color="info")
         self._log_status("Cleared current pattern.")
 
@@ -2092,6 +2392,7 @@ class PlotterApp:
         self._update_pattern_summary()
         self._update_pen_filter_options()
         self._update_canvas()
+        self._update_eta_breakdown()
 
     def _clone_pattern_item(self, item: Union[Line, Polyline, Circle]) -> Union[Line, Polyline, Circle]:
         if isinstance(item, Polyline):
@@ -2579,7 +2880,11 @@ class PlotterApp:
             for child in element:
                 traverse(child, current_transform)
 
-        traverse(root, self._identity_transform())
+        # SVG uses a Y-down coordinate system, while the plotter bed (and the
+        # canvas world) is Y-up. Seed the traversal with a vertical flip so
+        # imported artwork is not mirrored top-to-bottom. The pattern is
+        # re-centred on the bed afterwards, so the flip only fixes orientation.
+        traverse(root, (1.0, 0.0, 0.0, -1.0, 0.0, 0.0))
 
         if not pattern.items:
             raise ValueError("No supported shapes found in SVG.")
