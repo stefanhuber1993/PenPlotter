@@ -96,6 +96,7 @@ class PlotterApp:
         self.progress_eta_label = None
         self.progress_remaining_label = None
         self.eta_breakdown_container = None
+        self.prerun_estimate_label = None
         self.color_picker = None
         self.canvas = None
         self.canvas_element = None
@@ -1628,6 +1629,15 @@ class PlotterApp:
                 on_change=self._on_pen_filter_changed,
             ).props("label='Pen' dense").classes("w-full text-[11px]")
 
+            with ui.row().classes("gap-2 items-center"):
+                self.prerun_estimate_label = ui.label("Estimated: --:--").classes(
+                    "text-[11px] text-gray-600"
+                )
+                ui.button(
+                    icon="refresh",
+                    on_click=self._update_eta_breakdown,
+                ).props("flat round dense size='xs' color=gray").tooltip("Recalculate estimate")
+
             with ui.row().classes("gap-2"):
                 self.run_start_button = ui.button(
                     "Start",
@@ -1712,20 +1722,20 @@ class PlotterApp:
 
     def _update_eta_breakdown(self) -> None:
         """Render an up-front per-pen time estimate in the Run tab. Each pen is
-        estimated as its own filtered run (the pen-swap workflow). Hidden when
-        the pattern has zero or one colour."""
+        estimated as its own filtered run (the pen-swap workflow). Per-pen
+        breakdown is hidden for single-colour patterns, but total is always shown."""
         container = self.eta_breakdown_container
         if container is None:
             return
         container.clear()
         if not self.pattern.items:
+            if self.prerun_estimate_label is not None:
+                self.prerun_estimate_label.set_text("Estimated: --:--")
             return
         groups: Dict[int, List[Polyline]] = {}
         for it in self.pattern.items:
             if isinstance(it, Polyline) and len(it.pts) >= 2:
                 groups.setdefault(int(getattr(it, "pen_id", 0)), []).append(it)
-        if len(groups) <= 1:
-            return  # single colour: the running ETA already covers it
 
         draw, travel, settle, start_xy = self._eta_feeds()
         per: Dict[int, dict] = {}
@@ -1746,6 +1756,13 @@ class PlotterApp:
                 sel_pid = int(selected)
             except (TypeError, ValueError):
                 sel_pid = None
+
+        sel_time_s = per[sel_pid]["time_s"] if (sel_pid is not None and sel_pid in per) else total_s
+        if self.prerun_estimate_label is not None:
+            self.prerun_estimate_label.set_text(f"Estimated: {self._fmt_duration(sel_time_s)}")
+
+        if len(groups) <= 1:
+            return  # single colour: pre-run label is sufficient
 
         with container:
             ui.label("Estimated time per pen").classes(
